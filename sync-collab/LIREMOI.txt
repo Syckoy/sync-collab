@@ -1,0 +1,31 @@
+Synchro complete du serveur local (toi + ton ami)
+=================================================
+
+Les deux lancent le script. Vous echangez un code une seule fois.
+Les deux codes DOIVENT ETRE DIFFERENTS. Si c'est le meme, voir plus bas.
+
+PREMIERE FOIS — TOI
+1. Double-clic sur sync.bat
+2. Envoie TON CODE a ton ami
+
+PREMIERE FOIS — TON AMI
+1. Il cree un dossier vide :  C:\Users\Lui\Desktop\server local
+2. Tu lui envoies UNIQUEMENT :
+   - sync.bat
+   - sync.ps1
+   - config.json
+   - LIREMOI.txt
+   - le dossier tools  (s'il existe deja)
+   PAS le dossier st-home, PAS ami.json, PAS logs
+   (ou lance envoyer-a-ton-ami.bat pour preparer le zip)
+3. Il met ces fichiers dans :  ...\server local\sync-collab\
+4. Il lance sync.bat
+5. SON code doit etre DIFFERENT du tien. Il te l'envoie.
+6. Chacun colle le code de l'autre.
+
+Si ton ami a LE MEME CODE que toi :
+- Il a recu ta "carte d'identite" (dossier st-home).
+- Chez LUI : supprimer le dossier sync-collab\st-home s'il existe.
+- Relancer sync.bat. Un nouveau code apparait. C'est bon.
+
+Les deux fenetres restent ouvertes pendant la copie (~32 Go la 1re fois).

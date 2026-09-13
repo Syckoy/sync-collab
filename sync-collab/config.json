@@ -1,0 +1,7 @@
+{
+  "folderId": "serveur-local-collab",
+  "folderLabel": "Serveur local",
+  "syncRoot": "..",
+  "guiPort": 8384,
+  "listenPort": 22000
+}
