@@ -1,8 +1,0 @@
-{
-  "githubRepo": "Syckoy/sync-collab",
-  "githubBranch": "main",
-  "folderId": "serveur-local-collab",
-  "folderLabel": "Serveur local",
-  "syncRoot": "..",
-  "guiPort": 8384
-}
