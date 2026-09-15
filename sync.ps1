@@ -175,18 +175,43 @@ function New-ServerPack($cfg) {
     return $item
 }
 
-function Send-Pixeldrain([string]$zipPath) {
+function Send-PackFile([string]$zipPath) {
     $curl = Get-Curl
     Write-Info "Envoi du pack (tu pourras fermer ensuite)..."
-    $raw = & $curl -sS -X POST "https://pixeldrain.com/api/file" -F ("file=@" + $zipPath)
-    if (-not $raw) { throw "Pas de reponse de l hebergeur." }
-    $json = $raw | ConvertFrom-Json
-    if (-not $json.id) { throw ("Echec upload : " + $raw) }
-    return [pscustomobject]@{
-        id   = [string]$json.id
-        url  = "https://pixeldrain.com/api/file/$($json.id)?download"
-        page = "https://pixeldrain.com/u/$($json.id)"
+
+    $raw = & $curl -sS -X POST "https://litterbox.catbox.moe/resources/internals/api.php" -F "reqtype=fileupload" -F "time=72h" -F "fileToUpload=@$zipPath"
+    if ($raw -and $raw -match "^https?://") {
+        $u = $raw.Trim()
+        Write-Ok "Pack envoye."
+        return [pscustomobject]@{ id = $u; url = $u; page = $u }
     }
+    Write-Warn ("Litterbox refuse : " + $raw)
+
+    $raw = & $curl -sS -F "file=@$zipPath" "https://0x0.st"
+    if ($raw -and $raw -match "^https?://") {
+        $u = $raw.Trim()
+        Write-Ok "Pack envoye."
+        return [pscustomobject]@{ id = $u; url = $u; page = $u }
+    }
+    Write-Warn ("0x0 refuse : " + $raw)
+
+    $raw = & $curl -sS -X POST "https://upload.gofile.io/uploadfile" -F "file=@$zipPath"
+    if ($raw) {
+        try {
+            $json = $raw | ConvertFrom-Json
+            if ($json.status -eq "ok" -and $json.data.downloadPage) {
+                $page = [string]$json.data.downloadPage
+                $fid = [string]$json.data.id
+                $token = [string]$json.data.guestToken
+                $link = $page
+                if ($json.data.directLink) { $link = [string]$json.data.directLink }
+                Write-Ok "Pack envoye."
+                return [pscustomobject]@{ id = $fid; url = $link; page = $page; token = $token }
+            }
+        } catch { }
+    }
+
+    throw ("Echec upload. Derniere reponse : " + $raw)
 }
 
 function Publish-Manifest($cfg, $up, $sizeBytes) {
@@ -234,7 +259,7 @@ function Invoke-Send {
     $cfg = Get-Cfg
     $pack = New-ServerPack $cfg
     try {
-        $up = Send-Pixeldrain $pack.FullName
+        $up = Send-PackFile $pack.FullName
         Publish-Manifest $cfg $up $pack.Length
         Write-Host ""
         Write-Ok "C est envoye. Tu peux FERMER le logiciel."
