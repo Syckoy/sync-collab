@@ -175,43 +175,73 @@ function New-ServerPack($cfg) {
     return $item
 }
 
+function Get-ShortErr([string]$s) {
+    if (-not $s) { return "(vide)" }
+    if ($s -match "uploads disabled") { return "hebergeur ferme (spam)" }
+    if ($s -match "(?i)internal server error|<html|<!doctype") { return "hebergeur down (erreur 500)" }
+    $t = $s.Trim()
+    if ($t.Length -gt 180) { return $t.Substring(0, 180) }
+    return $t
+}
+
 function Send-PackFile([string]$zipPath) {
     $curl = Get-Curl
     Write-Info "Envoi du pack (tu pourras fermer ensuite)..."
+    $fileForm = "file=@$zipPath"
 
-    $raw = & $curl -sS -X POST "https://litterbox.catbox.moe/resources/internals/api.php" -F "reqtype=fileupload" -F "time=72h" -F "fileToUpload=@$zipPath"
-    if ($raw -and $raw -match "^https?://") {
-        $u = $raw.Trim()
-        Write-Ok "Pack envoye."
-        return [pscustomobject]@{ id = $u; url = $u; page = $u }
-    }
-    Write-Warn ("Litterbox refuse : " + $raw)
-
-    $raw = & $curl -sS -F "file=@$zipPath" "https://0x0.st"
-    if ($raw -and $raw -match "^https?://") {
-        $u = $raw.Trim()
-        Write-Ok "Pack envoye."
-        return [pscustomobject]@{ id = $u; url = $u; page = $u }
-    }
-    Write-Warn ("0x0 refuse : " + $raw)
-
-    $raw = & $curl -sS -X POST "https://upload.gofile.io/uploadfile" -F "file=@$zipPath"
-    if ($raw) {
-        try {
-            $json = $raw | ConvertFrom-Json
-            if ($json.status -eq "ok" -and $json.data.downloadPage) {
-                $page = [string]$json.data.downloadPage
-                $fid = [string]$json.data.id
-                $token = [string]$json.data.guestToken
-                $link = $page
-                if ($json.data.directLink) { $link = [string]$json.data.directLink }
-                Write-Ok "Pack envoye."
-                return [pscustomobject]@{ id = $fid; url = $link; page = $page; token = $token }
+    Write-Info "Tentative Gofile..."
+    $raw = & $curl -sS -A "sync-collab" -X POST "https://upload.gofile.io/uploadfile" -F $fileForm
+    try {
+        $json = $raw | ConvertFrom-Json
+        if ($json.status -eq "ok" -and $json.data) {
+            $page = [string]$json.data.downloadPage
+            $fid = [string]$json.data.id
+            $fname = [string]$json.data.name
+            if (-not $fname) { $fname = "serveur-pack.zip" }
+            $server = $null
+            if ($json.data.servers) {
+                $sv = @($json.data.servers)
+                if ($sv.Count -gt 0) { $server = [string]$sv[0] }
             }
-        } catch { }
-    }
+            $link = $page
+            if ($json.data.directLink) {
+                $link = [string]$json.data.directLink
+            } elseif ($server -and $fid) {
+                $link = "https://{0}.gofile.io/download/web/{1}/{2}" -f $server, $fid, [uri]::EscapeDataString($fname)
+            }
+            Write-Ok "Pack envoye via Gofile."
+            return [pscustomobject]@{
+                id    = $fid
+                url   = $link
+                page  = $page
+                token = [string]$json.data.guestToken
+            }
+        }
+    } catch { }
+    Write-Warn ("Gofile : " + (Get-ShortErr $raw))
 
-    throw ("Echec upload. Derniere reponse : " + $raw)
+    Write-Info "Tentative bashupload..."
+    $raw = & $curl -sS -T $zipPath "https://bashupload.com/serveur-pack.zip"
+    if ($raw -and $raw -match "https?://\S+") {
+        $u = ([regex]::Match($raw, "https?://\S+")).Value.Trim().TrimEnd(".")
+        Write-Ok "Pack envoye."
+        return [pscustomobject]@{ id = $u; url = $u; page = $u }
+    }
+    Write-Warn ("bashupload : " + (Get-ShortErr $raw))
+
+    Write-Info "Tentative file.io..."
+    $raw = & $curl -sS -F $fileForm "https://file.io/?expires=2d"
+    try {
+        $json = $raw | ConvertFrom-Json
+        if ($json.success -and $json.link) {
+            $u = [string]$json.link
+            Write-Ok "Pack envoye."
+            return [pscustomobject]@{ id = $u; url = $u; page = $u }
+        }
+    } catch { }
+    Write-Warn ("file.io : " + (Get-ShortErr $raw))
+
+    throw "Echec upload : tous les hebergeurs ont refuse. Reessaie dans 2 minutes."
 }
 
 function Publish-Manifest($cfg, $up, $sizeBytes) {
@@ -221,6 +251,7 @@ function Publish-Manifest($cfg, $up, $sizeBytes) {
         id        = $up.id
         url       = $up.url
         page      = $up.page
+        token     = $up.token
         sentAt    = (Get-Date).ToString("o")
         sizeBytes = $sizeBytes
         name      = "serveur-pack.zip"
@@ -278,7 +309,7 @@ function Invoke-Receive {
     $zip = Join-Path $env:TEMP ("serveur-recv-" + [guid]::NewGuid().ToString("N") + ".zip")
     $curl = Get-Curl
     Write-Info "Telechargement du pack..."
-    & $curl -L --fail -o $zip $man.url
+    & $curl -L --fail -A "Mozilla/5.0" -o $zip $man.url
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $zip)) { throw "Telechargement echoue." }
 
     $extract = Join-Path $env:TEMP ("serveur-recv-" + [guid]::NewGuid().ToString("N"))
