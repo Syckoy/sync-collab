@@ -3,9 +3,5 @@
   "githubBranch": "main",
   "dropChannel": "syckoy-gmod-sync-collab",
   "syncRoot": "..",
-  "packFolders": [
-    "steamapps/common/GarrysModDS/garrysmod/addons",
-    "steamapps/common/GarrysModDS/garrysmod/gamemodes/mangarp",
-    "steamapps/common/GarrysModDS/garrysmod/cfg"
-  ]
+  "gmodRel": "steamapps/common/GarrysModDS/garrysmod"
 }

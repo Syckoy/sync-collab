@@ -171,47 +171,189 @@ function Invoke-GithubUpdate {
     return $true
 }
 
-function Get-PackFolders($cfg, [switch]$RequireExist) {
-    $syncRoot = Get-SyncRoot $cfg
-    $rels = @($cfg.packFolders)
-    if (-not $rels -or $rels.Count -eq 0) {
-        $rels = @(
-            "steamapps/common/GarrysModDS/garrysmod/addons",
-            "steamapps/common/GarrysModDS/garrysmod/gamemodes/mangarp",
-            "steamapps/common/GarrysModDS/garrysmod/cfg"
-        )
+Add-Type -AssemblyName System.IO.Compression
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+
+function Get-GmodSkip {
+    return @(
+        "bin", "cache", "download", "downloadlists", "fallbacks", "html", "maps",
+        "particles", "resource", "scenes", "backgrounds", "lua", "data"
+    )
+}
+
+function Get-DsSkip {
+    return @(
+        "garrysmod", "bin", "platform", "sourceengine", "steam_cache", "logs",
+        "package", "userdata", "appcache", "depotcache", "config", "steamapps", "sync"
+    )
+}
+
+function Test-SkipPackFile([string]$name) {
+    if ($name -match "sync-conflict") { return $true }
+    if ($name -eq "desktop.ini" -or $name -eq "Thumbs.db") { return $true }
+    if ($name -like "*.rar" -or $name -like "*.zip") { return $true }
+    return $false
+}
+
+function Find-GmodDir($cfg) {
+    $root = Get-SyncRoot $cfg
+    $rel = "steamapps/common/GarrysModDS/garrysmod"
+    if ($cfg.gmodRel) { $rel = [string]$cfg.gmodRel }
+    $full = Join-Path $root ($rel -replace "/", "\")
+    if (Test-Path -LiteralPath (Join-Path $full "addons")) {
+        return Get-Item -LiteralPath $full
     }
-    $list = @()
-    foreach ($rel in $rels) {
-        $full = Join-Path $syncRoot ($rel -replace "/", "\")
-        if (-not (Test-Path -LiteralPath $full)) {
-            if ($RequireExist) {
-                Write-Warn ("Ignore (introuvable) : " + $rel)
-                continue
+    $common = Join-Path $root "steamapps\common"
+    if (Test-Path -LiteralPath $common) {
+        foreach ($d in Get-ChildItem -LiteralPath $common -Directory -ErrorAction SilentlyContinue) {
+            $g = Join-Path $d.FullName "garrysmod"
+            if (Test-Path -LiteralPath (Join-Path $g "addons")) {
+                return Get-Item -LiteralPath $g
             }
         }
-        $list += [pscustomobject]@{ Rel = $rel; Full = $full; Name = Split-Path $full -Leaf }
     }
-    if ($list.Count -eq 0) { throw "Aucun dossier serveur a empaqueter. Verifie packFolders dans config.json." }
-    return $list
+    $direct = Join-Path $root "garrysmod"
+    if (Test-Path -LiteralPath (Join-Path $direct "addons")) {
+        return Get-Item -LiteralPath $direct
+    }
+    throw "Dossier garrysmod introuvable (addons manquant)."
+}
+
+function Get-RelUnix([string]$base, [string]$full) {
+    $b = $base.TrimEnd("\", "/")
+    $f = $full
+    if ($f.Length -lt $b.Length) { return $null }
+    $prefix = $f.Substring(0, $b.Length)
+    if ($prefix -ne $b -and $prefix.ToLowerInvariant() -ne $b.ToLowerInvariant()) { return $null }
+    $rest = $f.Substring($b.Length).TrimStart("\", "/")
+    return ($rest -replace "\\", "/")
+}
+
+function Get-RootSkip {
+    return @(
+        "steamapps", "sync", "bin", "appcache", "config", "depotcache", "logs",
+        "package", "public", "siteserverui", "userdata", "garrysmod", "platform",
+        "sourceengine", "steam_cache"
+    )
+}
+
+function Get-PackTargets($cfg) {
+    $gmod = Find-GmodDir $cfg
+    $ds = $gmod.Directory.FullName
+    $syncRoot = Get-SyncRoot $cfg
+    $gmodSkip = Get-GmodSkip
+    $dsSkip = Get-DsSkip
+    $rootSkip = Get-RootSkip
+    $targets = @()
+    $seen = @{}
+    foreach ($d in Get-ChildItem -LiteralPath $gmod.FullName -Directory -ErrorAction SilentlyContinue) {
+        if ($gmodSkip -contains $d.Name.ToLowerInvariant()) { continue }
+        $targets += [pscustomobject]@{
+            Scope = "gmod"
+            Name  = $d.Name
+            Full  = $d.FullName
+        }
+        $seen[$d.FullName.ToLowerInvariant()] = $true
+        Write-Info ("Inclus : garrysmod/" + $d.Name)
+    }
+    foreach ($d in Get-ChildItem -LiteralPath $ds -Directory -ErrorAction SilentlyContinue) {
+        $key = $d.Name.ToLowerInvariant()
+        if ($dsSkip -contains $key) { continue }
+        if ($key -like "sync-collab*") { continue }
+        $targets += [pscustomobject]@{
+            Scope = "ds"
+            Name  = $d.Name
+            Full  = $d.FullName
+        }
+        $seen[$d.FullName.ToLowerInvariant()] = $true
+        Write-Info ("Inclus (a cote de garrysmod) : " + $d.Name)
+    }
+    if ($syncRoot.ToLowerInvariant() -ne $ds.ToLowerInvariant()) {
+        foreach ($d in Get-ChildItem -LiteralPath $syncRoot -Directory -ErrorAction SilentlyContinue) {
+            $key = $d.Name.ToLowerInvariant()
+            if ($rootSkip -contains $key) { continue }
+            if ($key -like "sync-collab*" -or $key -like "steam*") { continue }
+            if ($seen.ContainsKey($d.FullName.ToLowerInvariant())) { continue }
+            $targets += [pscustomobject]@{
+                Scope = "root"
+                Name  = $d.Name
+                Full  = $d.FullName
+            }
+            Write-Info ("Inclus (racine serveur) : " + $d.Name)
+        }
+    }
+    if ($targets.Count -eq 0) { throw "Rien a empaqueter dans garrysmod." }
+    return [pscustomobject]@{ Gmod = $gmod; Ds = $ds; Targets = $targets }
+}
+
+function New-Utf8Zip([string]$zipPath, [string]$mode) {
+    if ($mode -eq "Create" -and (Test-Path -LiteralPath $zipPath)) {
+        Remove-Item -LiteralPath $zipPath -Force
+    }
+    $enc = New-Object System.Text.UTF8Encoding $false
+    if ($mode -eq "Create") {
+        $fs = [System.IO.File]::Open($zipPath, [System.IO.FileMode]::Create)
+        return New-Object System.IO.Compression.ZipArchive($fs, [System.IO.Compression.ZipArchiveMode]::Create, $false, $enc)
+    }
+    $fs = [System.IO.File]::Open($zipPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+    return New-Object System.IO.Compression.ZipArchive($fs, [System.IO.Compression.ZipArchiveMode]::Read, $false, $enc)
 }
 
 function New-ServerPack($cfg) {
-    $folders = Get-PackFolders $cfg -RequireExist
-    $stage = Join-Path $env:TEMP ("sync-pack-" + [guid]::NewGuid().ToString("N"))
-    New-Item -ItemType Directory -Path $stage | Out-Null
-    foreach ($f in $folders) {
-        $dest = Join-Path $stage $f.Name
-        Write-Info ("Ajout : " + $f.Rel)
-        Copy-Item -LiteralPath $f.Full -Destination $dest -Recurse -Force
+    $pack = Get-PackTargets $cfg
+    $zipPath = Join-Path $env:TEMP ("serveur-pack-" + (Get-Date -Format "yyyyMMdd-HHmmss") + ".zip")
+    Write-Info "Compression du pack (chemins + dates conserves)..."
+    $zip = New-Utf8Zip $zipPath "Create"
+    $files = New-Object System.Collections.Generic.List[object]
+    $dirs = New-Object System.Collections.Generic.List[object]
+    try {
+        foreach ($t in $pack.Targets) {
+            $dirs.Add(@{ scope = $t.Scope; name = $t.Name; rel = $t.Name })
+            Get-ChildItem -LiteralPath $t.Full -Directory -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
+                $rel = Get-RelUnix $t.Full $_.FullName
+                if ($rel) {
+                    $dirs.Add(@{ scope = $t.Scope; name = $t.Name; rel = ($t.Name + "/" + $rel) })
+                }
+            }
+            Get-ChildItem -LiteralPath $t.Full -File -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
+                if (Test-SkipPackFile $_.Name) { return }
+                $rel = Get-RelUnix $t.Full $_.FullName
+                if (-not $rel) { return }
+                $entryRel = ($t.Name + "/" + $rel)
+                $entryName = "content/" + $t.Scope + "/" + $entryRel
+                try {
+                    [void][System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
+                        $zip, $_.FullName, $entryName, [System.IO.Compression.CompressionLevel]::Fastest
+                    )
+                } catch {
+                    Write-Warn ("Ignore (fichier bloque) : " + $entryRel)
+                    return
+                }
+                $files.Add(@{
+                    scope    = $t.Scope
+                    name     = $t.Name
+                    rel      = $entryRel
+                    size     = [int64]$_.Length
+                    mtimeUtc = $_.LastWriteTimeUtc.ToString("o")
+                })
+            }
+        }
+        $indexObj = @{
+            format = "sync-collab-v2"
+            sentAt = (Get-Date).ToUniversalTime().ToString("o")
+            files  = @($files.ToArray())
+            dirs   = @($dirs.ToArray())
+        }
+        $json = $indexObj | ConvertTo-Json -Depth 6 -Compress
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
+        $entry = $zip.CreateEntry("index.json")
+        $es = $entry.Open()
+        try { $es.Write($bytes, 0, $bytes.Length) } finally { $es.Close() }
+    } finally {
+        $zip.Dispose()
     }
-    $zip = Join-Path $env:TEMP ("serveur-pack-" + (Get-Date -Format "yyyyMMdd-HHmmss") + ".zip")
-    if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip -Force }
-    Write-Info "Compression du pack..."
-    Compress-Archive -Path (Join-Path $stage "*") -DestinationPath $zip -Force
-    try { Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue } catch { }
-    $item = Get-Item -LiteralPath $zip
-    Write-Ok ("Pack pret : {0:N1} Mo" -f ($item.Length / 1MB))
+    $item = Get-Item -LiteralPath $zipPath
+    Write-Ok ("Pack pret : {0:N1} Mo, {1} fichiers" -f ($item.Length / 1MB), $files.Count)
     return $item
 }
 
@@ -345,11 +487,156 @@ function Invoke-Send {
     }
 }
 
+function Get-ScopeBase($cfg, $gmod, [string]$scope) {
+    if ($scope -eq "ds") { return $gmod.Directory.FullName }
+    if ($scope -eq "root") { return Get-SyncRoot $cfg }
+    return $gmod.FullName
+}
+
+function Expand-Utf8Zip([string]$zipPath, [string]$dest) {
+    if (-not (Test-Path -LiteralPath $dest)) {
+        New-Item -ItemType Directory -Path $dest | Out-Null
+    }
+    $zip = New-Utf8Zip $zipPath "Read"
+    try {
+        foreach ($e in $zip.Entries) {
+            $name = [string]$e.FullName
+            if (-not $name -or $name.EndsWith("/") -or $name.EndsWith("\")) { continue }
+            $target = Join-Path $dest ($name -replace "/", "\")
+            $dir = Split-Path $target -Parent
+            if (-not (Test-Path -LiteralPath $dir)) {
+                New-Item -ItemType Directory -Path $dir -Force | Out-Null
+            }
+            [System.IO.Compression.ZipFileExtensions]::ExtractToFile($e, $target, $true)
+        }
+    } finally {
+        $zip.Dispose()
+    }
+}
+
+function Read-PackIndex([string]$extract) {
+    $p = Join-Path $extract "index.json"
+    if (-not (Test-Path -LiteralPath $p)) { return $null }
+    return Get-Content -LiteralPath $p -Raw -Encoding UTF8 | ConvertFrom-Json
+}
+
+function Invoke-MirrorPack($cfg, $gmod, $index, [string]$extract) {
+    $added = 0
+    $updated = 0
+    $kept = 0
+    $removed = 0
+    $content = Join-Path $extract "content"
+    $remoteFiles = @{}
+    $packedRoots = @{}
+
+    foreach ($d in @($index.dirs)) {
+        $base = Get-ScopeBase $cfg $gmod ([string]$d.scope)
+        $rel = [string]$d.rel
+        if (-not $rel) { continue }
+        $dest = Join-Path $base ($rel -replace "/", "\")
+        if (-not (Test-Path -LiteralPath $dest)) {
+            New-Item -ItemType Directory -Path $dest -Force | Out-Null
+        }
+    }
+
+    foreach ($f in @($index.files)) {
+        $key = ([string]$f.scope) + "|" + ([string]$f.rel)
+        $remoteFiles[$key] = $f
+        $rootKey = ([string]$f.scope) + "|" + ([string]$f.name)
+        $packedRoots[$rootKey] = $true
+        $base = Get-ScopeBase $cfg $gmod ([string]$f.scope)
+        $dest = Join-Path $base (($f.rel -replace "/", "\"))
+        $src = Join-Path $content ((([string]$f.scope) + "\" + ($f.rel -replace "/", "\")))
+        if (-not (Test-Path -LiteralPath $src)) {
+            Write-Warn ("Fichier absent du zip : " + $f.rel)
+            continue
+        }
+        $remoteM = [datetime]::Parse([string]$f.mtimeUtc, $null, [System.Globalization.DateTimeStyles]::RoundtripKind)
+        if (-not (Test-Path -LiteralPath $dest)) {
+            $dir = Split-Path $dest -Parent
+            if (-not (Test-Path -LiteralPath $dir)) {
+                New-Item -ItemType Directory -Path $dir -Force | Out-Null
+            }
+            [System.IO.File]::Copy($src, $dest, $true)
+            [System.IO.File]::SetLastWriteTimeUtc($dest, $remoteM)
+            $added++
+            continue
+        }
+        $localM = (Get-Item -LiteralPath $dest).LastWriteTimeUtc
+        if ($remoteM -ge $localM) {
+            [System.IO.File]::Copy($src, $dest, $true)
+            [System.IO.File]::SetLastWriteTimeUtc($dest, $remoteM)
+            $updated++
+        } else {
+            $kept++
+        }
+    }
+
+    foreach ($rootKey in $packedRoots.Keys) {
+        $parts = $rootKey.Split("|", 2)
+        $scope = $parts[0]
+        $name = $parts[1]
+        $base = Join-Path (Get-ScopeBase $cfg $gmod $scope) $name
+        if (-not (Test-Path -LiteralPath $base)) { continue }
+        Get-ChildItem -LiteralPath $base -File -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
+            if (Test-SkipPackFile $_.Name) { return }
+            $rel = Get-RelUnix $base $_.FullName
+            if (-not $rel) { return }
+            $key = $scope + "|" + $name + "/" + $rel
+            if (-not $remoteFiles.ContainsKey($key)) {
+                Remove-Item -LiteralPath $_.FullName -Force
+                $removed++
+            }
+        }
+        Get-ChildItem -LiteralPath $base -Directory -Recurse -ErrorAction SilentlyContinue |
+            Sort-Object { $_.FullName.Length } -Descending |
+            ForEach-Object {
+                $has = Get-ChildItem -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue
+                if (-not $has) {
+                    Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue
+                }
+            }
+    }
+
+    Write-Host ""
+    Write-Ok ("Ajoutes : " + $added)
+    Write-Ok ("Mis a jour (plus recents chez l autre) : " + $updated)
+    if ($kept -gt 0) { Write-Warn ("Gardes chez toi (plus recents) : " + $kept) }
+    Write-Ok ("Supprimes (enleves chez l autre) : " + $removed)
+}
+
+function Invoke-LegacyReceive($gmod, [string]$extract) {
+    Write-Warn "Ancien pack (sans index). Copie brute addons/cfg/gamemodes."
+    $map = @{
+        "addons"  = (Join-Path $gmod.FullName "addons")
+        "cfg"     = (Join-Path $gmod.FullName "cfg")
+        "mangarp" = (Join-Path $gmod.FullName "gamemodes\mangarp")
+    }
+    Get-ChildItem -LiteralPath $extract -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+        $name = $_.Name
+        if ($map.ContainsKey($name)) {
+            $dest = $map[$name]
+            if (-not (Test-Path -LiteralPath $dest)) {
+                New-Item -ItemType Directory -Path $dest -Force | Out-Null
+            }
+            Write-Info ("Mise a jour : " + $name)
+            Copy-Item -Path (Join-Path $_.FullName '*') -Destination $dest -Recurse -Force
+        } else {
+            $dest = Join-Path $gmod.FullName $name
+            Write-Info ("Dossier extra : " + $name)
+            if (-not (Test-Path -LiteralPath $dest)) {
+                New-Item -ItemType Directory -Path $dest -Force | Out-Null
+            }
+            Copy-Item -Path (Join-Path $_.FullName '*') -Destination $dest -Recurse -Force
+        }
+    }
+}
+
 function Invoke-Receive {
     $cfg = Get-Cfg
     Write-Info "Recherche de la derniere version envoyee..."
     $man = Get-Manifest $cfg
-    Write-Ok ("Trouvé : " + $man.sentAt)
+    Write-Ok ("Trouve : " + $man.sentAt)
     $zip = Join-Path $env:TEMP ("serveur-recv-" + [guid]::NewGuid().ToString("N") + ".zip")
     $curl = Get-Curl
     Write-Info "Telechargement du pack..."
@@ -362,24 +649,15 @@ function Invoke-Receive {
     $extract = Join-Path $env:TEMP ("serveur-recv-" + [guid]::NewGuid().ToString("N"))
     New-Item -ItemType Directory -Path $extract | Out-Null
     Write-Info "Extraction..."
-    Expand-Archive -LiteralPath $zip -DestinationPath $extract -Force
+    Expand-Utf8Zip $zip $extract
 
-    $folders = Get-PackFolders $cfg
-    $byName = @{}
-    foreach ($f in $folders) { $byName[$f.Name] = $f }
-
-    Get-ChildItem -LiteralPath $extract -Directory | ForEach-Object {
-        $name = $_.Name
-        if ($byName.ContainsKey($name)) {
-            $dest = $byName[$name].Full
-            Write-Info ("Mise a jour : " + $byName[$name].Rel)
-            if (-not (Test-Path -LiteralPath $dest)) {
-                New-Item -ItemType Directory -Path $dest -Force | Out-Null
-            }
-            Copy-Item -Path (Join-Path $_.FullName '*') -Destination $dest -Recurse -Force
-        } else {
-            Write-Warn ("Dossier ignore (pas dans config) : " + $name)
-        }
+    $gmod = Find-GmodDir $cfg
+    $index = Read-PackIndex $extract
+    if ($index -and $index.format -eq "sync-collab-v2") {
+        Write-Info "Comparaison ancienne version / pack recu..."
+        Invoke-MirrorPack $cfg $gmod $index $extract
+    } else {
+        Invoke-LegacyReceive $gmod $extract
     }
 
     try { Remove-Item -LiteralPath $zip -Force -ErrorAction SilentlyContinue } catch { }
