@@ -195,6 +195,11 @@ function Test-SkipPackFile([string]$name) {
     return $false
 }
 
+function Get-GmodParent($gmod) {
+    if ($gmod.Parent -and $gmod.Parent.FullName) { return $gmod.Parent.FullName }
+    return [System.IO.Path]::GetDirectoryName($gmod.FullName)
+}
+
 function Find-GmodDir($cfg) {
     $root = Get-SyncRoot $cfg
     $rel = "steamapps/common/GarrysModDS/garrysmod"
@@ -215,6 +220,16 @@ function Find-GmodDir($cfg) {
     $direct = Join-Path $root "garrysmod"
     if (Test-Path -LiteralPath (Join-Path $direct "addons")) {
         return Get-Item -LiteralPath $direct
+    }
+    foreach ($d in Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue) {
+        $g = Join-Path $d.FullName "garrysmod"
+        if (Test-Path -LiteralPath (Join-Path $g "addons")) {
+            return Get-Item -LiteralPath $g
+        }
+        $addonsDirect = Join-Path $d.FullName "addons"
+        if ((Test-Path -LiteralPath $addonsDirect) -and (Test-Path -LiteralPath (Join-Path $d.FullName "cfg"))) {
+            return Get-Item -LiteralPath $d.FullName
+        }
     }
     throw "Dossier garrysmod introuvable (addons manquant)."
 }
@@ -239,7 +254,7 @@ function Get-RootSkip {
 
 function Get-PackTargets($cfg) {
     $gmod = Find-GmodDir $cfg
-    $ds = $gmod.Directory.FullName
+    $ds = Get-GmodParent $gmod
     $syncRoot = Get-SyncRoot $cfg
     $gmodSkip = Get-GmodSkip
     $dsSkip = Get-DsSkip
@@ -256,19 +271,23 @@ function Get-PackTargets($cfg) {
         $seen[$d.FullName.ToLowerInvariant()] = $true
         Write-Info ("Inclus : garrysmod/" + $d.Name)
     }
-    foreach ($d in Get-ChildItem -LiteralPath $ds -Directory -ErrorAction SilentlyContinue) {
-        $key = $d.Name.ToLowerInvariant()
-        if ($dsSkip -contains $key) { continue }
-        if ($key -like "sync-collab*") { continue }
-        $targets += [pscustomobject]@{
-            Scope = "ds"
-            Name  = $d.Name
-            Full  = $d.FullName
+    if ($ds) {
+        foreach ($d in Get-ChildItem -LiteralPath $ds -Directory -ErrorAction SilentlyContinue) {
+            $key = $d.Name.ToLowerInvariant()
+            if ($dsSkip -contains $key) { continue }
+            if ($key -like "sync-collab*") { continue }
+            $targets += [pscustomobject]@{
+                Scope = "ds"
+                Name  = $d.Name
+                Full  = $d.FullName
+            }
+            $seen[$d.FullName.ToLowerInvariant()] = $true
+            Write-Info ("Inclus (a cote de garrysmod) : " + $d.Name)
         }
-        $seen[$d.FullName.ToLowerInvariant()] = $true
-        Write-Info ("Inclus (a cote de garrysmod) : " + $d.Name)
     }
-    if ($syncRoot.ToLowerInvariant() -ne $ds.ToLowerInvariant()) {
+    $dsNorm = ""
+    if ($ds) { $dsNorm = $ds.ToLowerInvariant() }
+    if ($syncRoot.ToLowerInvariant() -ne $dsNorm) {
         foreach ($d in Get-ChildItem -LiteralPath $syncRoot -Directory -ErrorAction SilentlyContinue) {
             $key = $d.Name.ToLowerInvariant()
             if ($rootSkip -contains $key) { continue }
@@ -488,7 +507,7 @@ function Invoke-Send {
 }
 
 function Get-ScopeBase($cfg, $gmod, [string]$scope) {
-    if ($scope -eq "ds") { return $gmod.Directory.FullName }
+    if ($scope -eq "ds") { return Get-GmodParent $gmod }
     if ($scope -eq "root") { return Get-SyncRoot $cfg }
     return $gmod.FullName
 }
