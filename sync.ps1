@@ -184,7 +184,8 @@ function Get-GmodSkip {
 function Get-DsSkip {
     return @(
         "garrysmod", "bin", "platform", "sourceengine", "steam_cache", "logs",
-        "package", "userdata", "appcache", "depotcache", "config", "steamapps", "sync"
+        "package", "userdata", "appcache", "depotcache", "config", "steamapps",
+        "sync", ".git", ".vs", ".idea", ".svn", "node_modules"
     )
 }
 
@@ -192,6 +193,25 @@ function Test-SkipPackFile([string]$name) {
     if ($name -match "sync-conflict") { return $true }
     if ($name -eq "desktop.ini" -or $name -eq "Thumbs.db") { return $true }
     if ($name -like "*.rar" -or $name -like "*.zip") { return $true }
+    return $false
+}
+
+function Test-SkipPackDirName([string]$name) {
+    if (-not $name) { return $true }
+    $n = $name.ToLowerInvariant()
+    if ($n.StartsWith(".")) { return $true }
+    $skip = @(".git", ".vs", ".idea", ".svn", "node_modules", "sync-collab-main", "sync-collab")
+    if ($skip -contains $n) { return $true }
+    if ($n -like "sync-collab*") { return $true }
+    return $false
+}
+
+function Test-SkipPackRel([string]$rel) {
+    if (-not $rel) { return $true }
+    $n = ($rel -replace "\\", "/").Trim("/")
+    if ($n -match "(^|/)(\.git|\.vs|\.idea|\.svn|node_modules)(/|$)") { return $true }
+    $first = ($n -split "/")[0]
+    if (Test-SkipPackDirName $first) { return $true }
     return $false
 }
 
@@ -248,11 +268,11 @@ function Get-RootSkip {
     return @(
         "steamapps", "sync", "bin", "appcache", "config", "depotcache", "logs",
         "package", "public", "siteserverui", "userdata", "garrysmod", "platform",
-        "sourceengine", "steam_cache"
+        "sourceengine", "steam_cache", ".git", ".vs", ".idea"
     )
 }
 
-function Get-PackTargets($cfg) {
+function Get-PackTargets($cfg, [switch]$Quiet) {
     $gmod = Find-GmodDir $cfg
     $ds = Get-GmodParent $gmod
     $syncRoot = Get-SyncRoot $cfg
@@ -263,18 +283,20 @@ function Get-PackTargets($cfg) {
     $seen = @{}
     foreach ($d in Get-ChildItem -LiteralPath $gmod.FullName -Directory -ErrorAction SilentlyContinue) {
         if ($gmodSkip -contains $d.Name.ToLowerInvariant()) { continue }
+        if (Test-SkipPackDirName $d.Name) { continue }
         $targets += [pscustomobject]@{
             Scope = "gmod"
             Name  = $d.Name
             Full  = $d.FullName
         }
         $seen[$d.FullName.ToLowerInvariant()] = $true
-        Write-Info ("Inclus : garrysmod/" + $d.Name)
+        if (-not $Quiet) { Write-Info ("Inclus : garrysmod/" + $d.Name) }
     }
     if ($ds) {
         foreach ($d in Get-ChildItem -LiteralPath $ds -Directory -ErrorAction SilentlyContinue) {
             $key = $d.Name.ToLowerInvariant()
             if ($dsSkip -contains $key) { continue }
+            if (Test-SkipPackDirName $d.Name) { continue }
             if ($key -like "sync-collab*") { continue }
             $targets += [pscustomobject]@{
                 Scope = "ds"
@@ -282,7 +304,7 @@ function Get-PackTargets($cfg) {
                 Full  = $d.FullName
             }
             $seen[$d.FullName.ToLowerInvariant()] = $true
-            Write-Info ("Inclus (a cote de garrysmod) : " + $d.Name)
+            if (-not $Quiet) { Write-Info ("Inclus (a cote de garrysmod) : " + $d.Name) }
         }
     }
     $dsNorm = ""
@@ -291,6 +313,7 @@ function Get-PackTargets($cfg) {
         foreach ($d in Get-ChildItem -LiteralPath $syncRoot -Directory -ErrorAction SilentlyContinue) {
             $key = $d.Name.ToLowerInvariant()
             if ($rootSkip -contains $key) { continue }
+            if (Test-SkipPackDirName $d.Name) { continue }
             if ($key -like "sync-collab*" -or $key -like "steam*") { continue }
             if ($seen.ContainsKey($d.FullName.ToLowerInvariant())) { continue }
             $targets += [pscustomobject]@{
@@ -298,7 +321,7 @@ function Get-PackTargets($cfg) {
                 Name  = $d.Name
                 Full  = $d.FullName
             }
-            Write-Info ("Inclus (racine serveur) : " + $d.Name)
+            if (-not $Quiet) { Write-Info ("Inclus (racine serveur) : " + $d.Name) }
         }
     }
     if ($targets.Count -eq 0) { throw "Rien a empaqueter dans garrysmod." }
@@ -330,15 +353,16 @@ function New-ServerPack($cfg) {
             $dirs.Add(@{ scope = $t.Scope; name = $t.Name; rel = $t.Name })
             Get-ChildItem -LiteralPath $t.Full -Directory -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
                 $rel = Get-RelUnix $t.Full $_.FullName
-                if ($rel) {
-                    $dirs.Add(@{ scope = $t.Scope; name = $t.Name; rel = ($t.Name + "/" + $rel) })
-                }
+                if (-not $rel) { return }
+                if (Test-SkipPackRel ($t.Name + "/" + $rel)) { return }
+                $dirs.Add(@{ scope = $t.Scope; name = $t.Name; rel = ($t.Name + "/" + $rel) })
             }
             Get-ChildItem -LiteralPath $t.Full -File -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
                 if (Test-SkipPackFile $_.Name) { return }
                 $rel = Get-RelUnix $t.Full $_.FullName
                 if (-not $rel) { return }
                 $entryRel = ($t.Name + "/" + $rel)
+                if (Test-SkipPackRel $entryRel) { return }
                 $entryName = "content/" + $t.Scope + "/" + $entryRel
                 try {
                     [void][System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
@@ -357,17 +381,34 @@ function New-ServerPack($cfg) {
                 })
             }
         }
+        $targetsMeta = @()
+        $treeLines = New-Object System.Collections.Generic.List[string]
+        $treeLines.Add("Arbre du serveur (cote envoi)")
+        $treeLines.Add(("Date UTC : " + (Get-Date).ToUniversalTime().ToString("o")))
+        $treeLines.Add("")
+        foreach ($t in $pack.Targets) {
+            $targetsMeta += @{ scope = $t.Scope; name = $t.Name }
+            $treeLines.Add(("[" + $t.Scope + "] " + $t.Name + "/"))
+        }
+        foreach ($d in $dirs) {
+            $treeLines.Add(("[" + $d.scope + "] " + $d.rel + "/"))
+        }
         $indexObj = @{
-            format = "sync-collab-v2"
-            sentAt = (Get-Date).ToUniversalTime().ToString("o")
-            files  = @($files.ToArray())
-            dirs   = @($dirs.ToArray())
+            format   = "sync-collab-v2"
+            sentAt   = (Get-Date).ToUniversalTime().ToString("o")
+            files    = @($files.ToArray())
+            dirs     = @($dirs.ToArray())
+            targets  = @($targetsMeta)
         }
         $json = $indexObj | ConvertTo-Json -Depth 6 -Compress
         $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
         $entry = $zip.CreateEntry("index.json")
         $es = $entry.Open()
         try { $es.Write($bytes, 0, $bytes.Length) } finally { $es.Close() }
+        $treeBytes = [System.Text.Encoding]::UTF8.GetBytes(($treeLines -join "`r`n"))
+        $treeEntry = $zip.CreateEntry("arbre-serveur.txt")
+        $ts = $treeEntry.Open()
+        try { $ts.Write($treeBytes, 0, $treeBytes.Length) } finally { $ts.Close() }
     } finally {
         $zip.Dispose()
     }
@@ -539,6 +580,49 @@ function Read-PackIndex([string]$extract) {
     return Get-Content -LiteralPath $p -Raw -Encoding UTF8 | ConvertFrom-Json
 }
 
+function Get-RemoteTopMap($index) {
+    $map = @{}
+    foreach ($t in @($index.targets)) {
+        if ($t -and $t.scope -and $t.name) {
+            $map[([string]$t.scope + "|" + [string]$t.name)] = $true
+        }
+    }
+    foreach ($d in @($index.dirs)) {
+        if ($d -and $d.scope -and $d.name) {
+            $map[([string]$d.scope + "|" + [string]$d.name)] = $true
+        }
+    }
+    foreach ($f in @($index.files)) {
+        if ($f -and $f.scope -and $f.name) {
+            $map[([string]$f.scope + "|" + [string]$f.name)] = $true
+        }
+    }
+    return $map
+}
+
+function Get-RemoteDirMap($index) {
+    $map = @{}
+    foreach ($d in @($index.dirs)) {
+        $rel = [string]$d.rel
+        if (-not $rel) { continue }
+        if (Test-SkipPackRel $rel) { continue }
+        $map[([string]$d.scope + "|" + $rel)] = $true
+    }
+    return $map
+}
+
+function Save-TreeDoc($index, [string]$path) {
+    $lines = New-Object System.Collections.Generic.List[string]
+    $lines.Add("Arbre du serveur recu")
+    if ($index.sentAt) { $lines.Add("Envoye : " + [string]$index.sentAt) }
+    $lines.Add("Les dossiers absents de cette liste sont supprimes chez toi.")
+    $lines.Add("")
+    foreach ($d in (@($index.dirs) | Sort-Object { [string]$_.scope + "/" + [string]$_.rel })) {
+        $lines.Add("[" + $d.scope + "] " + $d.rel + "/")
+    }
+    [System.IO.File]::WriteAllLines($path, $lines.ToArray(), (New-Object System.Text.UTF8Encoding $false))
+}
+
 function Invoke-MirrorPack($cfg, $gmod, $index, [string]$extract) {
     $added = 0
     $updated = 0
@@ -548,17 +632,21 @@ function Invoke-MirrorPack($cfg, $gmod, $index, [string]$extract) {
     $remoteFiles = @{}
     $packedRoots = @{}
 
+    $denied = 0
+
     foreach ($d in @($index.dirs)) {
         $base = Get-ScopeBase $cfg $gmod ([string]$d.scope)
         $rel = [string]$d.rel
         if (-not $rel) { continue }
+        if (Test-SkipPackRel $rel) { continue }
         $dest = Join-Path $base ($rel -replace "/", "\")
         if (-not (Test-Path -LiteralPath $dest)) {
-            New-Item -ItemType Directory -Path $dest -Force | Out-Null
+            try { New-Item -ItemType Directory -Path $dest -Force | Out-Null } catch { }
         }
     }
 
     foreach ($f in @($index.files)) {
+        if (Test-SkipPackRel ([string]$f.rel) -or Test-SkipPackDirName ([string]$f.name)) { continue }
         $key = ([string]$f.scope) + "|" + ([string]$f.rel)
         $remoteFiles[$key] = $f
         $rootKey = ([string]$f.scope) + "|" + ([string]$f.name)
@@ -571,50 +659,88 @@ function Invoke-MirrorPack($cfg, $gmod, $index, [string]$extract) {
             continue
         }
         $remoteM = [datetime]::Parse([string]$f.mtimeUtc, $null, [System.Globalization.DateTimeStyles]::RoundtripKind)
-        if (-not (Test-Path -LiteralPath $dest)) {
-            $dir = Split-Path $dest -Parent
-            if (-not (Test-Path -LiteralPath $dir)) {
-                New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        try {
+            if (-not (Test-Path -LiteralPath $dest)) {
+                $dir = Split-Path $dest -Parent
+                if (-not (Test-Path -LiteralPath $dir)) {
+                    New-Item -ItemType Directory -Path $dir -Force | Out-Null
+                }
+                [System.IO.File]::Copy($src, $dest, $true)
+                [System.IO.File]::SetLastWriteTimeUtc($dest, $remoteM)
+                $added++
+                continue
             }
-            [System.IO.File]::Copy($src, $dest, $true)
-            [System.IO.File]::SetLastWriteTimeUtc($dest, $remoteM)
-            $added++
-            continue
-        }
-        $localM = (Get-Item -LiteralPath $dest).LastWriteTimeUtc
-        if ($remoteM -ge $localM) {
-            [System.IO.File]::Copy($src, $dest, $true)
-            [System.IO.File]::SetLastWriteTimeUtc($dest, $remoteM)
-            $updated++
-        } else {
-            $kept++
+            $localM = (Get-Item -LiteralPath $dest).LastWriteTimeUtc
+            if ($remoteM -ge $localM) {
+                [System.IO.File]::Copy($src, $dest, $true)
+                [System.IO.File]::SetLastWriteTimeUtc($dest, $remoteM)
+                $updated++
+            } else {
+                $kept++
+            }
+        } catch {
+            $denied++
+            Write-Warn ("Ignore (acces refuse) : " + $f.rel)
         }
     }
 
-    foreach ($rootKey in $packedRoots.Keys) {
+    $remoteTops = Get-RemoteTopMap $index
+    $remoteDirs = Get-RemoteDirMap $index
+    $localPack = Get-PackTargets $cfg -Quiet
+    foreach ($t in @($localPack.Targets)) {
+        if (Test-SkipPackDirName $t.Name) { continue }
+        $k = [string]$t.Scope + "|" + [string]$t.Name
+        if ($remoteTops.ContainsKey($k)) { continue }
+        Write-Info ("Suppression dossier (plus / deplace chez l autre) : " + $t.Name)
+        try {
+            Remove-Item -LiteralPath $t.Full -Recurse -Force -ErrorAction Stop
+            $removed++
+        } catch {
+            $denied++
+            Write-Warn ("Impossible de supprimer : " + $t.Name)
+        }
+    }
+
+    foreach ($rootKey in $remoteTops.Keys) {
         $parts = $rootKey.Split("|", 2)
         $scope = $parts[0]
         $name = $parts[1]
+        if (Test-SkipPackDirName $name) { continue }
         $base = Join-Path (Get-ScopeBase $cfg $gmod $scope) $name
         if (-not (Test-Path -LiteralPath $base)) { continue }
-        Get-ChildItem -LiteralPath $base -File -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
-            if (Test-SkipPackFile $_.Name) { return }
-            $rel = Get-RelUnix $base $_.FullName
-            if (-not $rel) { return }
+
+        $localFiles = @(Get-ChildItem -LiteralPath $base -File -Recurse -ErrorAction SilentlyContinue)
+        foreach ($lf in $localFiles) {
+            if (Test-SkipPackFile $lf.Name) { continue }
+            $rel = Get-RelUnix $base $lf.FullName
+            if (-not $rel) { continue }
+            if (Test-SkipPackRel ($name + "/" + $rel)) { continue }
             $key = $scope + "|" + $name + "/" + $rel
-            if (-not $remoteFiles.ContainsKey($key)) {
-                Remove-Item -LiteralPath $_.FullName -Force
+            if ($remoteFiles.ContainsKey($key)) { continue }
+            try {
+                Remove-Item -LiteralPath $lf.FullName -Force -ErrorAction Stop
                 $removed++
+            } catch { $denied++ }
+        }
+
+        $localDirs = @(Get-ChildItem -LiteralPath $base -Directory -Recurse -ErrorAction SilentlyContinue | Sort-Object { $_.FullName.Length } -Descending)
+        foreach ($ld in $localDirs) {
+            if (-not (Test-Path -LiteralPath $ld.FullName)) { continue }
+            if (Test-SkipPackDirName $ld.Name) { continue }
+            $rel = Get-RelUnix $base $ld.FullName
+            if (-not $rel) { continue }
+            if (Test-SkipPackRel ($name + "/" + $rel)) { continue }
+            $dkey = $scope + "|" + $name + "/" + $rel
+            if ($remoteDirs.ContainsKey($dkey)) { continue }
+            Write-Info ("Suppression sous-dossier (plus chez l autre) : " + $name + "/" + $rel)
+            try {
+                Remove-Item -LiteralPath $ld.FullName -Recurse -Force -ErrorAction Stop
+                $removed++
+            } catch {
+                $denied++
+                Write-Warn ("Impossible de supprimer : " + $rel)
             }
         }
-        Get-ChildItem -LiteralPath $base -Directory -Recurse -ErrorAction SilentlyContinue |
-            Sort-Object { $_.FullName.Length } -Descending |
-            ForEach-Object {
-                $has = Get-ChildItem -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue
-                if (-not $has) {
-                    Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue
-                }
-            }
     }
 
     Write-Host ""
@@ -622,6 +748,7 @@ function Invoke-MirrorPack($cfg, $gmod, $index, [string]$extract) {
     Write-Ok ("Mis a jour (plus recents chez l autre) : " + $updated)
     if ($kept -gt 0) { Write-Warn ("Gardes chez toi (plus recents) : " + $kept) }
     Write-Ok ("Supprimes (enleves chez l autre) : " + $removed)
+    if ($denied -gt 0) { Write-Warn ("Ignores (acces refuse / .git) : " + $denied) }
 }
 
 function Invoke-LegacyReceive($gmod, [string]$extract) {
@@ -675,6 +802,9 @@ function Invoke-Receive {
     if ($index -and $index.format -eq "sync-collab-v2") {
         Write-Info "Comparaison ancienne version / pack recu..."
         Invoke-MirrorPack $cfg $gmod $index $extract
+        $treeOut = Join-Path $Root ".dernier-arbre.txt"
+        try { Save-TreeDoc $index $treeOut } catch { }
+        Write-Info ("Arbre de l autre enregistre : " + $treeOut)
     } else {
         Invoke-LegacyReceive $gmod $extract
     }
