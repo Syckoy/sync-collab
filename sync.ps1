@@ -56,6 +56,16 @@ function Get-Curl {
     return $c
 }
 
+function Convert-VerNum([string]$v) {
+    if (-not $v) { return 0 }
+    $parts = @($v.Split("."))
+    $n = 0
+    if ($parts.Count -gt 0) { $n += ([int]$parts[0]) * 10000 }
+    if ($parts.Count -gt 1) { $n += ([int]$parts[1]) * 100 }
+    if ($parts.Count -gt 2) { $n += [int]$parts[2] }
+    return $n
+}
+
 function Invoke-GithubUpdate {
     if ($env:SYNC_COLLAB_UPDATED -eq "1") { return $false }
     if ($Command -eq "noupdate") { return $false }
@@ -91,6 +101,20 @@ function Invoke-GithubUpdate {
     }
 
     $shortRemote = $remoteCommit.Substring(0, [Math]::Min(7, $remoteCommit.Length))
+
+    $localVer = "0"
+    if ($version -and $version.version) { $localVer = [string]$version.version }
+    try {
+        $remoteVerObj = Invoke-RestMethod -Uri ("https://raw.githubusercontent.com/{0}/{1}/version.json" -f $repo, $branch) -Headers $headers -TimeoutSec 15
+        if ($remoteVerObj -and $remoteVerObj.version) {
+            $remoteVerEarly = [string]$remoteVerObj.version
+            if ((Convert-VerNum $localVer) -gt (Convert-VerNum $remoteVerEarly)) {
+                Write-Warn ("GitHub est en retard (local " + $localVer + " / GitHub " + $remoteVerEarly + "). Upload le dossier sync a la racine du repo.")
+                return $false
+            }
+        }
+    } catch { }
+
     Write-Host ""
     Write-Warn "Une mise a jour du LOGICIEL est disponible."
     Write-Host ("Version GitHub : " + $shortRemote)
@@ -116,6 +140,20 @@ function Invoke-GithubUpdate {
     if (-not $ps1) { throw "sync.ps1 introuvable dans GitHub. Mets les fichiers a la racine du repo, pas dans un sous-dossier." }
     $srcDir = $ps1.Directory.FullName
 
+    $localVer = "0"
+    $remoteVer = "0"
+    if ($version -and $version.version) { $localVer = [string]$version.version }
+    $remoteVerFile = Join-Path $srcDir "version.json"
+    if (Test-Path -LiteralPath $remoteVerFile) {
+        $rv = Read-JsonFile $remoteVerFile
+        if ($rv -and $rv.version) { $remoteVer = [string]$rv.version }
+    }
+    if ((Convert-VerNum $localVer) -gt (Convert-VerNum $remoteVer)) {
+        Write-Warn ("GitHub est en retard (local " + $localVer + " / GitHub " + $remoteVer + "). Upload les fichiers du dossier sync a la racine du repo.")
+        try { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue } catch { }
+        return $false
+    }
+
     foreach ($name in $AllowUpdate) {
         $src = Join-Path $srcDir $name
         if (Test-Path -LiteralPath $src) {
@@ -133,7 +171,7 @@ function Invoke-GithubUpdate {
     return $true
 }
 
-function Get-PackFolders($cfg) {
+function Get-PackFolders($cfg, [switch]$RequireExist) {
     $syncRoot = Get-SyncRoot $cfg
     $rels = @($cfg.packFolders)
     if (-not $rels -or $rels.Count -eq 0) {
@@ -146,18 +184,20 @@ function Get-PackFolders($cfg) {
     $list = @()
     foreach ($rel in $rels) {
         $full = Join-Path $syncRoot ($rel -replace "/", "\")
-        if (Test-Path -LiteralPath $full) {
-            $list += [pscustomobject]@{ Rel = $rel; Full = $full; Name = Split-Path $full -Leaf }
-        } else {
-            Write-Warn ("Ignore (introuvable) : " + $rel)
+        if (-not (Test-Path -LiteralPath $full)) {
+            if ($RequireExist) {
+                Write-Warn ("Ignore (introuvable) : " + $rel)
+                continue
+            }
         }
+        $list += [pscustomobject]@{ Rel = $rel; Full = $full; Name = Split-Path $full -Leaf }
     }
     if ($list.Count -eq 0) { throw "Aucun dossier serveur a empaqueter. Verifie packFolders dans config.json." }
     return $list
 }
 
 function New-ServerPack($cfg) {
-    $folders = Get-PackFolders $cfg
+    $folders = Get-PackFolders $cfg -RequireExist
     $stage = Join-Path $env:TEMP ("sync-pack-" + [guid]::NewGuid().ToString("N"))
     New-Item -ItemType Directory -Path $stage | Out-Null
     foreach ($f in $folders) {
@@ -189,39 +229,17 @@ function Send-PackFile([string]$zipPath) {
     Write-Info "Envoi du pack (tu pourras fermer ensuite)..."
     $fileForm = "file=@$zipPath"
 
-    Write-Info "Tentative Gofile..."
-    $raw = & $curl -sS -A "sync-collab" -X POST "https://upload.gofile.io/uploadfile" -F $fileForm
-    try {
-        $json = $raw | ConvertFrom-Json
-        if ($json.status -eq "ok" -and $json.data) {
-            $page = [string]$json.data.downloadPage
-            $fid = [string]$json.data.id
-            $fname = [string]$json.data.name
-            if (-not $fname) { $fname = "serveur-pack.zip" }
-            $server = $null
-            if ($json.data.servers) {
-                $sv = @($json.data.servers)
-                if ($sv.Count -gt 0) { $server = [string]$sv[0] }
-            }
-            $link = $page
-            if ($json.data.directLink) {
-                $link = [string]$json.data.directLink
-            } elseif ($server -and $fid) {
-                $link = "https://{0}.gofile.io/download/web/{1}/{2}" -f $server, $fid, [uri]::EscapeDataString($fname)
-            }
-            Write-Ok "Pack envoye via Gofile."
-            return [pscustomobject]@{
-                id    = $fid
-                url   = $link
-                page  = $page
-                token = [string]$json.data.guestToken
-            }
-        }
-    } catch { }
-    Write-Warn ("Gofile : " + (Get-ShortErr $raw))
+    Write-Info "Tentative catbox..."
+    $raw = & $curl -sS -A "sync-collab" -F "reqtype=fileupload" -F "fileToUpload=@$zipPath" "https://catbox.moe/user/api.php"
+    if ($raw -and $raw -match "^https?://\S+$") {
+        $u = $raw.Trim()
+        Write-Ok "Pack envoye."
+        return [pscustomobject]@{ id = $u; url = $u; page = $u }
+    }
+    Write-Warn ("catbox : " + (Get-ShortErr $raw))
 
     Write-Info "Tentative bashupload..."
-    $raw = & $curl -sS -T $zipPath "https://bashupload.com/serveur-pack.zip"
+    $raw = & $curl -sS -A "sync-collab" -T $zipPath "https://bashupload.com/serveur-pack.zip"
     if ($raw -and $raw -match "https?://\S+") {
         $u = ([regex]::Match($raw, "https?://\S+")).Value.Trim().TrimEnd(".")
         Write-Ok "Pack envoye."
@@ -230,7 +248,7 @@ function Send-PackFile([string]$zipPath) {
     Write-Warn ("bashupload : " + (Get-ShortErr $raw))
 
     Write-Info "Tentative file.io..."
-    $raw = & $curl -sS -F $fileForm "https://file.io/?expires=2d"
+    $raw = & $curl -sS -A "sync-collab" -F $fileForm "https://file.io/?expires=2d"
     try {
         $json = $raw | ConvertFrom-Json
         if ($json.success -and $json.link) {
@@ -260,30 +278,56 @@ function Publish-Manifest($cfg, $up, $sizeBytes) {
     Invoke-RestMethod -Method POST -Uri $uri -Body $manifest -ContentType "text/plain; charset=utf-8" | Out-Null
 }
 
+function Test-DirectPackUrl([string]$url) {
+    if (-not $url) { return $false }
+    if ($url -match "(?i)gofile\.io") { return $false }
+    return $true
+}
+
+function Test-ZipFile([string]$path) {
+    if (-not (Test-Path -LiteralPath $path)) { return $false }
+    $fs = [System.IO.File]::OpenRead($path)
+    try {
+        if ($fs.Length -lt 4) { return $false }
+        $b0 = $fs.ReadByte()
+        $b1 = $fs.ReadByte()
+        return ($b0 -eq 0x50 -and $b1 -eq 0x4B)
+    } finally { $fs.Close() }
+}
+
 function Get-Manifest($cfg) {
     $channel = [string]$cfg.dropChannel
     if (-not $channel) { $channel = "syckoy-gmod-sync-collab" }
+    $curl = Get-Curl
     $uri = "https://ntfy.sh/" + $channel + "/json?poll=1"
-    $raw = Invoke-WebRequest -Uri $uri -UseBasicParsing -TimeoutSec 20
-    $lines = @()
-    if ($raw.Content) {
-        $lines = $raw.Content -split "`n" | Where-Object { $_.Trim() -ne "" }
-    }
-    if ($lines.Count -eq 0) { throw "Aucune version envoyee pour le moment." }
+    $raw = & $curl -sS -A "sync-collab" $uri
+    if ($LASTEXITCODE -ne 0 -or -not $raw) { throw "Aucune version envoyee pour le moment." }
+    $lines = $raw -split "`n" | Where-Object { $_.Trim() -ne "" }
     $last = $null
+    $sawGofile = $false
     foreach ($line in $lines) {
         try {
             $ev = $line | ConvertFrom-Json
             if ($ev.message) {
-                $msg = $ev.message
+                $msg = [string]$ev.message
                 if ($msg.Trim().StartsWith("{")) {
-                    $last = $msg | ConvertFrom-Json
+                    $man = $msg | ConvertFrom-Json
+                    if ($man.url) {
+                        if (Test-DirectPackUrl ([string]$man.url)) {
+                            $last = $man
+                        } else {
+                            $sawGofile = $true
+                        }
+                    }
                 }
             }
         } catch { }
     }
-    if (-not $last -or -not $last.url) { throw "Manifest invalide. L autre doit renvoyer une version." }
-    return $last
+    if ($last) { return $last }
+    if ($sawGofile) {
+        throw "L envoi de ton ami est encore sur Gofile (page web, pas un vrai fichier). Demande-lui de relancer sync.bat, accepter la maj, puis ENVOYER (2)."
+    }
+    throw "Manifest invalide. L autre doit renvoyer une version."
 }
 
 function Invoke-Send {
@@ -311,6 +355,9 @@ function Invoke-Receive {
     Write-Info "Telechargement du pack..."
     & $curl -L --fail -A "Mozilla/5.0" -o $zip $man.url
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $zip)) { throw "Telechargement echoue." }
+    if (-not (Test-ZipFile $zip)) {
+        throw "Le fichier telecharge n est pas un zip. Demande a ton ami de renvoyer avec la nouvelle version (bouton 2)."
+    }
 
     $extract = Join-Path $env:TEMP ("serveur-recv-" + [guid]::NewGuid().ToString("N"))
     New-Item -ItemType Directory -Path $extract | Out-Null
