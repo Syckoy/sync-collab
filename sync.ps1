@@ -175,32 +175,40 @@ Add-Type -AssemblyName System.IO.Compression
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 
 function Get-GmodSkip {
-    return @(
-        "bin", "cache", "download", "downloadlists", "fallbacks", "html", "maps",
-        "particles", "resource", "scenes", "backgrounds", "lua", "data"
-    )
+    # RIEN : on empaquete tout garrysmod (addons, data, lua, maps, cfg, etc.)
+    return @()
 }
 
 function Get-DsSkip {
+    # garrysmod = deja pris via Get-GmodSkip/targets ; sync = outil ; steamapps = hors perimetre
     return @(
-        "garrysmod", "bin", "platform", "sourceengine", "steam_cache", "logs",
-        "package", "userdata", "appcache", "depotcache", "config", "steamapps",
-        "sync", ".git", ".vs", ".idea", ".svn", "node_modules"
+        "garrysmod", "steamapps", "sync",
+        ".git", ".vs", ".idea", ".svn", "node_modules"
+    )
+}
+
+function Get-RootSkip {
+    return @(
+        "steamapps", "sync", ".git", ".vs", ".idea"
     )
 }
 
 function Test-SkipPackFile([string]$name) {
     if ($name -match "sync-conflict") { return $true }
     if ($name -eq "desktop.ini" -or $name -eq "Thumbs.db") { return $true }
-    if ($name -like "*.rar" -or $name -like "*.zip") { return $true }
     return $false
+}
+
+function Test-SkipLooseRootFile([string]$name) {
+    # Tous les fichiers racine (bat, exe, dll, txt...) sauf poubelle Windows
+    return (Test-SkipPackFile $name)
 }
 
 function Test-SkipPackDirName([string]$name) {
     if (-not $name) { return $true }
     $n = $name.ToLowerInvariant()
-    if ($n.StartsWith(".")) { return $true }
-    $skip = @(".git", ".vs", ".idea", ".svn", "node_modules", "sync-collab-main", "sync-collab")
+    # Uniquement meta / outil - PAS les dossiers de contenu du jeu
+    $skip = @(".git", ".vs", ".idea", ".svn", "node_modules", "sync-collab-main", "sync-collab", "sync")
     if ($skip -contains $n) { return $true }
     if ($n -like "sync-collab*") { return $true }
     return $false
@@ -209,9 +217,11 @@ function Test-SkipPackDirName([string]$name) {
 function Test-SkipPackRel([string]$rel) {
     if (-not $rel) { return $true }
     $n = ($rel -replace "\\", "/").Trim("/")
-    if ($n -match "(^|/)(\.git|\.vs|\.idea|\.svn|node_modules)(/|$)") { return $true }
-    $first = ($n -split "/")[0]
-    if (Test-SkipPackDirName $first) { return $true }
+    if ($n -match "(^|/)(\.git|\.vs|\.idea|\.svn|node_modules|sync-collab)(/|$)") { return $true }
+    $parts = $n -split "/"
+    foreach ($p in $parts) {
+        if (Test-SkipPackDirName $p) { return $true }
+    }
     return $false
 }
 
@@ -262,14 +272,6 @@ function Get-RelUnix([string]$base, [string]$full) {
     if ($prefix -ne $b -and $prefix.ToLowerInvariant() -ne $b.ToLowerInvariant()) { return $null }
     $rest = $f.Substring($b.Length).TrimStart("\", "/")
     return ($rest -replace "\\", "/")
-}
-
-function Get-RootSkip {
-    return @(
-        "steamapps", "sync", "bin", "appcache", "config", "depotcache", "logs",
-        "package", "public", "siteserverui", "userdata", "garrysmod", "platform",
-        "sourceengine", "steam_cache", ".git", ".vs", ".idea"
-    )
 }
 
 function Get-PackTargets($cfg, [switch]$Quiet) {
@@ -325,7 +327,23 @@ function Get-PackTargets($cfg, [switch]$Quiet) {
         }
     }
     if ($targets.Count -eq 0) { throw "Rien a empaqueter dans garrysmod." }
-    return [pscustomobject]@{ Gmod = $gmod; Ds = $ds; Targets = $targets }
+
+    # Fichiers a la racine garrysmod / a cote (start.bat, configs) - avant ils etaient ignores
+    $loose = @()
+    foreach ($f in Get-ChildItem -LiteralPath $gmod.FullName -File -ErrorAction SilentlyContinue) {
+        if (Test-SkipLooseRootFile $f.Name) { continue }
+        $loose += [pscustomobject]@{ Scope = "gmod"; Name = $f.Name; Full = $f.FullName; IsLoose = $true }
+        if (-not $Quiet) { Write-Info ("Inclus (fichier garrysmod/) : " + $f.Name) }
+    }
+    if ($ds) {
+        foreach ($f in Get-ChildItem -LiteralPath $ds -File -ErrorAction SilentlyContinue) {
+            if (Test-SkipLooseRootFile $f.Name) { continue }
+            $loose += [pscustomobject]@{ Scope = "ds"; Name = $f.Name; Full = $f.FullName; IsLoose = $true }
+            if (-not $Quiet) { Write-Info ("Inclus (fichier a cote) : " + $f.Name) }
+        }
+    }
+
+    return [pscustomobject]@{ Gmod = $gmod; Ds = $ds; Targets = $targets; LooseFiles = $loose }
 }
 
 function New-Utf8Zip([string]$zipPath, [string]$mode) {
@@ -380,6 +398,28 @@ function New-ServerPack($cfg) {
                     mtimeUtc = $_.LastWriteTimeUtc.ToString("o")
                 })
             }
+        }
+
+        # Fichiers racine (start.bat, etc.)
+        foreach ($lf in @($pack.LooseFiles)) {
+            $entryRel = $lf.Name
+            $entryName = "content/" + $lf.Scope + "/" + $entryRel
+            try {
+                [void][System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
+                    $zip, $lf.Full, $entryName, [System.IO.Compression.CompressionLevel]::Fastest
+                )
+            } catch {
+                Write-Warn ("Ignore (fichier bloque) : " + $entryRel)
+                continue
+            }
+            $files.Add(@{
+                scope    = $lf.Scope
+                name     = $lf.Name
+                rel      = $entryRel
+                size     = [int64](Get-Item -LiteralPath $lf.Full).Length
+                mtimeUtc = (Get-Item -LiteralPath $lf.Full).LastWriteTimeUtc.ToString("o")
+                loose    = $true
+            })
         }
         $targetsMeta = @()
         $treeLines = New-Object System.Collections.Generic.List[string]
@@ -899,6 +939,7 @@ function Invoke-MirrorPack($cfg, $gmod, $index, [string]$extract) {
     $packedRoots = @{}
 
     $denied = 0
+    Write-Info "Politique : version de l autre prioritaire (ajouts + ecrasements)."
 
     foreach ($d in @($index.dirs)) {
         $base = Get-ScopeBase $cfg $gmod ([string]$d.scope)
@@ -926,23 +967,20 @@ function Invoke-MirrorPack($cfg, $gmod, $index, [string]$extract) {
         }
         $remoteM = [datetime]::Parse([string]$f.mtimeUtc, $null, [System.Globalization.DateTimeStyles]::RoundtripKind)
         try {
-            if (-not (Test-Path -LiteralPath $dest)) {
+            $existed = Test-Path -LiteralPath $dest
+            if ($existed) {
+                # Toujours prendre la version envoyee (l autre a fait ENVOYER = source de verite)
+                [System.IO.File]::Copy($src, $dest, $true)
+                [System.IO.File]::SetLastWriteTimeUtc($dest, $remoteM)
+                $updated++
+            } else {
                 $dir = Split-Path $dest -Parent
-                if (-not (Test-Path -LiteralPath $dir)) {
+                if ($dir -and -not (Test-Path -LiteralPath $dir)) {
                     New-Item -ItemType Directory -Path $dir -Force | Out-Null
                 }
                 [System.IO.File]::Copy($src, $dest, $true)
                 [System.IO.File]::SetLastWriteTimeUtc($dest, $remoteM)
                 $added++
-                continue
-            }
-            $localM = (Get-Item -LiteralPath $dest).LastWriteTimeUtc
-            if ($remoteM -ge $localM) {
-                [System.IO.File]::Copy($src, $dest, $true)
-                [System.IO.File]::SetLastWriteTimeUtc($dest, $remoteM)
-                $updated++
-            } else {
-                $kept++
             }
         } catch {
             $denied++
@@ -974,6 +1012,9 @@ function Invoke-MirrorPack($cfg, $gmod, $index, [string]$extract) {
         if (Test-SkipPackDirName $name) { continue }
         $base = Join-Path (Get-ScopeBase $cfg $gmod $scope) $name
         if (-not (Test-Path -LiteralPath $base)) { continue }
+        # Fichiers racine (start.bat) : pas un dossier a scanner
+        $baseItem = Get-Item -LiteralPath $base -ErrorAction SilentlyContinue
+        if ($baseItem -and -not $baseItem.PSIsContainer) { continue }
 
         $localFiles = @(Get-ChildItem -LiteralPath $base -File -Recurse -ErrorAction SilentlyContinue)
         foreach ($lf in $localFiles) {
@@ -1011,7 +1052,7 @@ function Invoke-MirrorPack($cfg, $gmod, $index, [string]$extract) {
 
     Write-Host ""
     Write-Ok ("Ajoutes : " + $added)
-    Write-Ok ("Mis a jour (plus recents chez l autre) : " + $updated)
+    Write-Ok ("Mis a jour depuis l autre : " + $updated)
     if ($kept -gt 0) { Write-Warn ("Gardes chez toi (plus recents) : " + $kept) }
     Write-Ok ("Supprimes (enleves chez l autre) : " + $removed)
     if ($denied -gt 0) { Write-Warn ("Ignores (acces refuse / .git) : " + $denied) }
