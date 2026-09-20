@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 param([string]$Command)
 
 $ErrorActionPreference = "Stop"
@@ -429,14 +429,14 @@ function Get-ShortErr([string]$s) {
 
 function Test-UploadUrl([string]$raw) {
     if (-not $raw) { return $null }
-    $m = [regex]::Match($raw.Trim(), "https?://[^\s`"']+")
+    $m = [regex]::Match($raw.Trim(), 'https?://\S+')
     if (-not $m.Success) { return $null }
     return $m.Value.Trim().TrimEnd(".", ",", ")", "]")
 }
 
 function Invoke-HostUpload([string]$name, [scriptblock]$attempt) {
-    for ($try = 1; $try -le 2; $try++) {
-        if ($try -gt 1) {
+    for ($n = 1; $n -le 2; $n++) {
+        if ($n -gt 1) {
             Write-Info ("Nouvelle tentative " + $name + " dans 3s...")
             Start-Sleep -Seconds 3
         } else {
@@ -472,10 +472,10 @@ function Send-PackFile([string]$zipPath) {
     $sizeMb = [math]::Round((Get-Item -LiteralPath $zipPath).Length / 1MB, 1)
     Write-Info ("Taille pack : " + $sizeMb + " Mo")
     if ($sizeMb -gt 190) {
-        Write-Warn "Pack > 190 Mo : catbox risque d echouer — litterbox / 0x0 prioritaires."
+        Write-Warn "Pack > 190 Mo : catbox risque d echouer - litterbox / 0x0 prioritaires."
     }
 
-    # Litterbox : jusqu a 1 Go, lien direct, expire 72h — ideal pour gros packs serveur
+    # Litterbox : jusqu a 1 Go, lien direct, expire 72h - ideal pour gros packs serveur
     $up = Invoke-HostUpload "litterbox" {
         & $curl -sS --connect-timeout 20 --max-time 600 -A "sync-collab" `
             -F "reqtype=fileupload" -F "time=72h" -F "fileToUpload=@$zipPath" `
