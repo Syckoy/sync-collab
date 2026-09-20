@@ -18,11 +18,10 @@ Envoi gros packs (v2.1+) :
   - chaque morceau est uploade separement (code MNC-XXXXXXXX)
   - a la reception, tous les morceaux sont retelecharges, fusionnes, puis appliques
 
-Reception (v2.2+) :
-  - TOUT garrysmod est pris (data, lua, maps, bat, dll, vpk, addons...)
-  - seuls exclus : dossier sync (l outil), .git / .vs, steamapps
-  - la version ENVOYEE par l autre ecrase toujours la tienne
-  - packs gros = multi-parts auto (~40 Mo)
+Reception (v2.2.2+) :
+  - FUSION uniquement : ajoute / remplace les fichiers du pack
+  - NE SUPPRIME JAMAIS tes autres dossiers
+  - packs gros = multi-parts + barre de progression a l envoi
 
 Pour GitHub : uploader UNIQUEMENT les fichiers de CE dossier
 (sync.bat, sync.ps1, config.json, version.json, README.md, .gitignore)

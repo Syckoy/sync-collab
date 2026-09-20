@@ -359,68 +359,132 @@ function New-Utf8Zip([string]$zipPath, [string]$mode) {
     return New-Object System.IO.Compression.ZipArchive($fs, [System.IO.Compression.ZipArchiveMode]::Read, $false, $enc)
 }
 
-function New-ServerPack($cfg) {
-    $pack = Get-PackTargets $cfg
-    $zipPath = Join-Path $env:TEMP ("serveur-pack-" + (Get-Date -Format "yyyyMMdd-HHmmss") + ".zip")
-    Write-Info "Compression du pack (chemins + dates conserves)..."
-    $zip = New-Utf8Zip $zipPath "Create"
-    $files = New-Object System.Collections.Generic.List[object]
-    $dirs = New-Object System.Collections.Generic.List[object]
-    try {
-        foreach ($t in $pack.Targets) {
-            $dirs.Add(@{ scope = $t.Scope; name = $t.Name; rel = $t.Name })
-            Get-ChildItem -LiteralPath $t.Full -Directory -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
-                $rel = Get-RelUnix $t.Full $_.FullName
-                if (-not $rel) { return }
-                if (Test-SkipPackRel ($t.Name + "/" + $rel)) { return }
-                $dirs.Add(@{ scope = $t.Scope; name = $t.Name; rel = ($t.Name + "/" + $rel) })
-            }
-            Get-ChildItem -LiteralPath $t.Full -File -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
-                if (Test-SkipPackFile $_.Name) { return }
-                $rel = Get-RelUnix $t.Full $_.FullName
-                if (-not $rel) { return }
-                $entryRel = ($t.Name + "/" + $rel)
-                if (Test-SkipPackRel $entryRel) { return }
-                $entryName = "content/" + $t.Scope + "/" + $entryRel
-                try {
-                    [void][System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
-                        $zip, $_.FullName, $entryName, [System.IO.Compression.CompressionLevel]::Fastest
-                    )
-                } catch {
-                    Write-Warn ("Ignore (fichier bloque) : " + $entryRel)
-                    return
-                }
-                $files.Add(@{
-                    scope    = $t.Scope
-                    name     = $t.Name
-                    rel      = $entryRel
-                    size     = [int64]$_.Length
-                    mtimeUtc = $_.LastWriteTimeUtc.ToString("o")
-                })
-            }
-        }
+function Get-ZipLevelForFile([string]$name) {
+    # Deja compresses / binaires : STORE (beaucoup plus rapide)
+    if ($name -match '(?i)\.(vpk|zip|rar|7z|gz|bz2|xz|png|jpg|jpeg|webp|gif|mp3|wav|ogg|mp4|webm|avi|dll|exe|pdb|dem|bsp|ttf|otf|woff|woff2)$') {
+        return [System.IO.Compression.CompressionLevel]::NoCompression
+    }
+    return [System.IO.Compression.CompressionLevel]::Fastest
+}
 
-        # Fichiers racine (start.bat, etc.)
-        foreach ($lf in @($pack.LooseFiles)) {
-            $entryRel = $lf.Name
-            $entryName = "content/" + $lf.Scope + "/" + $entryRel
-            try {
-                [void][System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
-                    $zip, $lf.Full, $entryName, [System.IO.Compression.CompressionLevel]::Fastest
-                )
-            } catch {
-                Write-Warn ("Ignore (fichier bloque) : " + $entryRel)
-                continue
-            }
-            $files.Add(@{
-                scope    = $lf.Scope
-                name     = $lf.Name
-                rel      = $entryRel
-                size     = [int64](Get-Item -LiteralPath $lf.Full).Length
-                mtimeUtc = (Get-Item -LiteralPath $lf.Full).LastWriteTimeUtc.ToString("o")
-                loose    = $true
+function Write-PackProgress([int]$done, [int]$total, [string]$current, [datetime]$started, [int64]$bytesDone) {
+    if ($total -le 0) { return }
+    $pct = [math]::Round(100.0 * $done / $total, 1)
+    $elapsed = (Get-Date) - $started
+    $eta = ""
+    if ($done -gt 0 -and $elapsed.TotalSeconds -gt 0.5) {
+        $remainSec = $elapsed.TotalSeconds * ($total - $done) / $done
+        if ($remainSec -lt 60) { $eta = (" ~{0:N0}s restantes" -f $remainSec) }
+        else { $eta = (" ~{0:N0} min restantes" -f ($remainSec / 60)) }
+    }
+    $mb = [math]::Round($bytesDone / 1MB, 1)
+    $short = $current
+    if ($short.Length -gt 55) { $short = "..." + $short.Substring($short.Length - 52) }
+    $line = ("  [{0}/{1}] {2}% | {3} Mo |{4} | {5}" -f $done, $total, $pct, $mb, $eta, $short)
+    Write-Host ("`r" + $line.PadRight(110)) -NoNewline
+    try {
+        Write-Progress -Activity "Compression du pack serveur" -Status $line.Trim() -PercentComplete ([math]::Min(99, [int]$pct))
+    } catch { }
+}
+
+function New-ServerPack($cfg) {
+    Write-Info "1/3 Scan des fichiers (patience, c est normal)..."
+    $pack = Get-PackTargets $cfg -Quiet
+    Write-Ok ("Dossiers inclus : " + $pack.Targets.Count)
+
+    $toPack = New-Object System.Collections.Generic.List[object]
+    $dirs = New-Object System.Collections.Generic.List[object]
+    $scanStart = Get-Date
+
+    foreach ($t in $pack.Targets) {
+        $dirs.Add(@{ scope = $t.Scope; name = $t.Name; rel = $t.Name })
+        Get-ChildItem -LiteralPath $t.Full -Directory -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
+            $rel = Get-RelUnix $t.Full $_.FullName
+            if (-not $rel) { return }
+            if (Test-SkipPackRel ($t.Name + "/" + $rel)) { return }
+            $dirs.Add(@{ scope = $t.Scope; name = $t.Name; rel = ($t.Name + "/" + $rel) })
+        }
+        Get-ChildItem -LiteralPath $t.Full -File -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
+            if (Test-SkipPackFile $_.Name) { return }
+            $rel = Get-RelUnix $t.Full $_.FullName
+            if (-not $rel) { return }
+            $entryRel = ($t.Name + "/" + $rel)
+            if (Test-SkipPackRel $entryRel) { return }
+            $toPack.Add([pscustomobject]@{
+                Scope     = $t.Scope
+                Name      = $t.Name
+                Rel       = $entryRel
+                Full      = $_.FullName
+                Size      = [int64]$_.Length
+                MtimeUtc  = $_.LastWriteTimeUtc
+                EntryName = ("content/" + $t.Scope + "/" + $entryRel)
             })
         }
+        $n = $toPack.Count
+        Write-Host ("`r  Scan... {0} fichiers trouves | dossier : {1}   " -f $n, $t.Name) -NoNewline
+    }
+    Write-Host ""
+
+    foreach ($lf in @($pack.LooseFiles)) {
+        $toPack.Add([pscustomobject]@{
+            Scope     = $lf.Scope
+            Name      = $lf.Name
+            Rel       = $lf.Name
+            Full      = $lf.Full
+            Size      = [int64](Get-Item -LiteralPath $lf.Full).Length
+            MtimeUtc  = (Get-Item -LiteralPath $lf.Full).LastWriteTimeUtc
+            EntryName = ("content/" + $lf.Scope + "/" + $lf.Name)
+            Loose     = $true
+        })
+    }
+
+    $total = $toPack.Count
+    $totalMb = [math]::Round((($toPack | Measure-Object -Property Size -Sum).Sum / 1MB), 1)
+    Write-Ok ("Scan OK : {0} fichiers ({1} Mo) en {2:N0}s" -f $total, $totalMb, ((Get-Date) - $scanStart).TotalSeconds)
+    if ($total -eq 0) { throw "Aucun fichier a empaqueter." }
+
+    $zipPath = Join-Path $env:TEMP ("serveur-pack-" + (Get-Date -Format "yyyyMMdd-HHmmss") + ".zip")
+    Write-Info "2/3 Compression (tu vois la progression ci-dessous)..."
+    Write-Host "  Astuce : les gros fichiers (vpk/maps) sont copies sans recompresser = plus rapide." -ForegroundColor DarkGray
+
+    $zip = New-Utf8Zip $zipPath "Create"
+    $files = New-Object System.Collections.Generic.List[object]
+    $done = 0
+    $bytesDone = [int64]0
+    $compStart = Get-Date
+    $skipped = 0
+    try {
+        foreach ($item in $toPack) {
+            $done++
+            $bytesDone += $item.Size
+            if (($done % 3 -eq 0) -or $done -eq 1 -or $done -eq $total -or $item.Size -gt 5MB) {
+                Write-PackProgress $done $total $item.Rel $compStart $bytesDone
+            }
+            try {
+                $level = Get-ZipLevelForFile ([System.IO.Path]::GetFileName($item.Full))
+                [void][System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
+                    $zip, $item.Full, $item.EntryName, $level
+                )
+            } catch {
+                $skipped++
+                Write-Host ""
+                Write-Warn ("Ignore (bloque) : " + $item.Rel)
+                continue
+            }
+            $meta = @{
+                scope    = $item.Scope
+                name     = $item.Name
+                rel      = $item.Rel
+                size     = $item.Size
+                mtimeUtc = $item.MtimeUtc.ToString("o")
+            }
+            if ($item.Loose) { $meta.loose = $true }
+            $files.Add($meta)
+        }
+        Write-Host ""
+        try { Write-Progress -Activity "Compression du pack serveur" -Completed } catch { }
+
+        Write-Info "3/3 Index + finalisation..."
         $targetsMeta = @()
         $treeLines = New-Object System.Collections.Generic.List[string]
         $treeLines.Add("Arbre du serveur (cote envoi)")
@@ -452,8 +516,11 @@ function New-ServerPack($cfg) {
     } finally {
         $zip.Dispose()
     }
+
     $item = Get-Item -LiteralPath $zipPath
-    Write-Ok ("Pack pret : {0:N1} Mo, {1} fichiers" -f ($item.Length / 1MB), $files.Count)
+    $sec = ((Get-Date) - $compStart).TotalSeconds
+    Write-Ok ("Pack pret : {0:N1} Mo, {1} fichiers, {2:N0}s" -f ($item.Length / 1MB), $files.Count, $sec)
+    if ($skipped -gt 0) { Write-Warn ("Fichiers ignores (bloques) : " + $skipped) }
     return $item
 }
 
@@ -837,8 +904,15 @@ function Get-Manifest($cfg) {
 
 function Invoke-Send {
     $cfg = Get-Cfg
+    Write-Host ""
+    Write-Host "=== ENVOI DU SERVEUR ===" -ForegroundColor Magenta
+    Write-Host "Etape A : compression (avec barre de progression)"
+    Write-Host "Etape B : upload (morceaux si gros pack)"
+    Write-Host ""
     $pack = New-ServerPack $cfg
     try {
+        Write-Host ""
+        Write-Info "Etape B : envoi en ligne..."
         $up = Send-PackFile $pack.FullName
         Publish-Manifest $cfg $up $pack.Length
         Write-Host ""
@@ -921,7 +995,8 @@ function Save-TreeDoc($index, [string]$path) {
     $lines = New-Object System.Collections.Generic.List[string]
     $lines.Add("Arbre du serveur recu")
     if ($index.sentAt) { $lines.Add("Envoye : " + [string]$index.sentAt) }
-    $lines.Add("Les dossiers absents de cette liste sont supprimes chez toi.")
+    $lines.Add("Mode fusion : on AJOUTE / REMPLACE les fichiers du pack.")
+    $lines.Add("Rien n est supprime chez toi hors du pack.")
     $lines.Add("")
     foreach ($d in (@($index.dirs) | Sort-Object { [string]$_.scope + "/" + [string]$_.rel })) {
         $lines.Add("[" + $d.scope + "] " + $d.rel + "/")
@@ -932,14 +1007,11 @@ function Save-TreeDoc($index, [string]$path) {
 function Invoke-MirrorPack($cfg, $gmod, $index, [string]$extract) {
     $added = 0
     $updated = 0
-    $kept = 0
-    $removed = 0
-    $content = Join-Path $extract "content"
-    $remoteFiles = @{}
-    $packedRoots = @{}
-
     $denied = 0
-    Write-Info "Politique : version de l autre prioritaire (ajouts + ecrasements)."
+    $content = Join-Path $extract "content"
+
+    Write-Info "Mode FUSION : on met a jour ce qui est dans le pack."
+    Write-Info "On ne supprime RIEN d autre chez toi (A/D/E/F restent)."
 
     foreach ($d in @($index.dirs)) {
         $base = Get-ScopeBase $cfg $gmod ([string]$d.scope)
@@ -954,10 +1026,6 @@ function Invoke-MirrorPack($cfg, $gmod, $index, [string]$extract) {
 
     foreach ($f in @($index.files)) {
         if (Test-SkipPackRel ([string]$f.rel) -or Test-SkipPackDirName ([string]$f.name)) { continue }
-        $key = ([string]$f.scope) + "|" + ([string]$f.rel)
-        $remoteFiles[$key] = $f
-        $rootKey = ([string]$f.scope) + "|" + ([string]$f.name)
-        $packedRoots[$rootKey] = $true
         $base = Get-ScopeBase $cfg $gmod ([string]$f.scope)
         $dest = Join-Path $base (($f.rel -replace "/", "\"))
         $src = Join-Path $content ((([string]$f.scope) + "\" + ($f.rel -replace "/", "\")))
@@ -965,97 +1033,37 @@ function Invoke-MirrorPack($cfg, $gmod, $index, [string]$extract) {
             Write-Warn ("Fichier absent du zip : " + $f.rel)
             continue
         }
-        $remoteM = [datetime]::Parse([string]$f.mtimeUtc, $null, [System.Globalization.DateTimeStyles]::RoundtripKind)
+        $remoteM = $null
+        try {
+            $remoteM = [datetime]::Parse([string]$f.mtimeUtc, $null, [System.Globalization.DateTimeStyles]::RoundtripKind)
+        } catch { }
+
         try {
             $existed = Test-Path -LiteralPath $dest
-            if ($existed) {
-                # Toujours prendre la version envoyee (l autre a fait ENVOYER = source de verite)
-                [System.IO.File]::Copy($src, $dest, $true)
-                [System.IO.File]::SetLastWriteTimeUtc($dest, $remoteM)
-                $updated++
-            } else {
+            if (-not $existed) {
                 $dir = Split-Path $dest -Parent
                 if ($dir -and -not (Test-Path -LiteralPath $dir)) {
                     New-Item -ItemType Directory -Path $dir -Force | Out-Null
                 }
-                [System.IO.File]::Copy($src, $dest, $true)
-                [System.IO.File]::SetLastWriteTimeUtc($dest, $remoteM)
-                $added++
             }
+            [System.IO.File]::Copy($src, $dest, $true)
+            if ($remoteM) {
+                try { [System.IO.File]::SetLastWriteTimeUtc($dest, $remoteM) } catch { }
+            }
+            if ($existed) { $updated++ } else { $added++ }
         } catch {
             $denied++
             Write-Warn ("Ignore (acces refuse) : " + $f.rel)
         }
     }
 
-    $remoteTops = Get-RemoteTopMap $index
-    $remoteDirs = Get-RemoteDirMap $index
-    $localPack = Get-PackTargets $cfg -Quiet
-    foreach ($t in @($localPack.Targets)) {
-        if (Test-SkipPackDirName $t.Name) { continue }
-        $k = [string]$t.Scope + "|" + [string]$t.Name
-        if ($remoteTops.ContainsKey($k)) { continue }
-        Write-Info ("Suppression dossier (plus / deplace chez l autre) : " + $t.Name)
-        try {
-            Remove-Item -LiteralPath $t.Full -Recurse -Force -ErrorAction Stop
-            $removed++
-        } catch {
-            $denied++
-            Write-Warn ("Impossible de supprimer : " + $t.Name)
-        }
-    }
-
-    foreach ($rootKey in $remoteTops.Keys) {
-        $parts = $rootKey.Split("|", 2)
-        $scope = $parts[0]
-        $name = $parts[1]
-        if (Test-SkipPackDirName $name) { continue }
-        $base = Join-Path (Get-ScopeBase $cfg $gmod $scope) $name
-        if (-not (Test-Path -LiteralPath $base)) { continue }
-        # Fichiers racine (start.bat) : pas un dossier a scanner
-        $baseItem = Get-Item -LiteralPath $base -ErrorAction SilentlyContinue
-        if ($baseItem -and -not $baseItem.PSIsContainer) { continue }
-
-        $localFiles = @(Get-ChildItem -LiteralPath $base -File -Recurse -ErrorAction SilentlyContinue)
-        foreach ($lf in $localFiles) {
-            if (Test-SkipPackFile $lf.Name) { continue }
-            $rel = Get-RelUnix $base $lf.FullName
-            if (-not $rel) { continue }
-            if (Test-SkipPackRel ($name + "/" + $rel)) { continue }
-            $key = $scope + "|" + $name + "/" + $rel
-            if ($remoteFiles.ContainsKey($key)) { continue }
-            try {
-                Remove-Item -LiteralPath $lf.FullName -Force -ErrorAction Stop
-                $removed++
-            } catch { $denied++ }
-        }
-
-        $localDirs = @(Get-ChildItem -LiteralPath $base -Directory -Recurse -ErrorAction SilentlyContinue | Sort-Object { $_.FullName.Length } -Descending)
-        foreach ($ld in $localDirs) {
-            if (-not (Test-Path -LiteralPath $ld.FullName)) { continue }
-            if (Test-SkipPackDirName $ld.Name) { continue }
-            $rel = Get-RelUnix $base $ld.FullName
-            if (-not $rel) { continue }
-            if (Test-SkipPackRel ($name + "/" + $rel)) { continue }
-            $dkey = $scope + "|" + $name + "/" + $rel
-            if ($remoteDirs.ContainsKey($dkey)) { continue }
-            Write-Info ("Suppression sous-dossier (plus chez l autre) : " + $name + "/" + $rel)
-            try {
-                Remove-Item -LiteralPath $ld.FullName -Recurse -Force -ErrorAction Stop
-                $removed++
-            } catch {
-                $denied++
-                Write-Warn ("Impossible de supprimer : " + $rel)
-            }
-        }
-    }
+    # PAS de suppression : le pack = overlay, pas un miroir destructeur.
 
     Write-Host ""
     Write-Ok ("Ajoutes : " + $added)
-    Write-Ok ("Mis a jour depuis l autre : " + $updated)
-    if ($kept -gt 0) { Write-Warn ("Gardes chez toi (plus recents) : " + $kept) }
-    Write-Ok ("Supprimes (enleves chez l autre) : " + $removed)
-    if ($denied -gt 0) { Write-Warn ("Ignores (acces refuse / .git) : " + $denied) }
+    Write-Ok ("Remplaces (depuis l autre) : " + $updated)
+    Write-Ok "Aucun dossier/fichier local supprime."
+    if ($denied -gt 0) { Write-Warn ("Ignores (acces refuse) : " + $denied) }
 }
 
 function Invoke-LegacyReceive($gmod, [string]$extract) {
@@ -1210,8 +1218,8 @@ function Show-Menu {
     Write-Host "=============================================="
     Write-Host ""
     Write-Host "  1) RECUPERER le serveur"
-    Write-Host "     Telecharge la derniere version envoyee"
-    Write-Host "     (l autre n a pas besoin d etre connecte)"
+    Write-Host "     Fusion : ajoute/remplace le travail de l autre"
+    Write-Host "     (ne supprime RIEN chez toi)"
     Write-Host ""
     Write-Host "  2) ENVOYER une nouvelle version"
     Write-Host "     Upload le pack, puis tu PEUX FERMER"
