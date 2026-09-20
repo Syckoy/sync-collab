@@ -427,10 +427,80 @@ function Get-ShortErr([string]$s) {
     return $t
 }
 
+function Get-FileSha256([string]$path) {
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    $fs = [System.IO.File]::OpenRead($path)
+    try {
+        $hash = $sha.ComputeHash($fs)
+        return ([System.BitConverter]::ToString($hash) -replace "-", "").ToLowerInvariant()
+    } finally {
+        $fs.Close()
+        $sha.Dispose()
+    }
+}
+
+function Split-FileToParts([string]$path, [int64]$chunkBytes, [string]$outDir) {
+    if (-not (Test-Path -LiteralPath $outDir)) {
+        New-Item -ItemType Directory -Path $outDir -Force | Out-Null
+    }
+    $parts = New-Object System.Collections.Generic.List[string]
+    $fs = [System.IO.File]::OpenRead($path)
+    try {
+        $buf = New-Object byte[] ([Math]::Min($chunkBytes, 4MB))
+        $index = 0
+        $remainingInChunk = $chunkBytes
+        $partPath = Join-Path $outDir ("part-{0:D4}.bin" -f $index)
+        $out = [System.IO.File]::Create($partPath)
+        try {
+            while ($true) {
+                $toRead = [Math]::Min($buf.Length, [int][Math]::Min($remainingInChunk, [int64][int]::MaxValue))
+                if ($toRead -le 0) { break }
+                $read = $fs.Read($buf, 0, $toRead)
+                if ($read -le 0) { break }
+                $out.Write($buf, 0, $read)
+                $remainingInChunk -= $read
+                if ($remainingInChunk -le 0) {
+                    $out.Close()
+                    $parts.Add($partPath)
+                    $index++
+                    $remainingInChunk = $chunkBytes
+                    $partPath = Join-Path $outDir ("part-{0:D4}.bin" -f $index)
+                    $out = [System.IO.File]::Create($partPath)
+                }
+            }
+        } finally {
+            if ($out) { $out.Close() }
+        }
+        # Derniere part non vide
+        if ((Test-Path -LiteralPath $partPath) -and ((Get-Item -LiteralPath $partPath).Length -gt 0)) {
+            if (-not $parts.Contains($partPath)) { $parts.Add($partPath) }
+        } elseif (Test-Path -LiteralPath $partPath) {
+            Remove-Item -LiteralPath $partPath -Force -ErrorAction SilentlyContinue
+        }
+    } finally {
+        $fs.Close()
+    }
+    return ,$parts.ToArray()
+}
+
+function Merge-FileParts([string[]]$partPaths, [string]$outPath) {
+    $out = [System.IO.File]::Create($outPath)
+    try {
+        $buf = New-Object byte[] (4MB)
+        foreach ($p in $partPaths) {
+            $fs = [System.IO.File]::OpenRead($p)
+            try {
+                while (($read = $fs.Read($buf, 0, $buf.Length)) -gt 0) {
+                    $out.Write($buf, 0, $read)
+                }
+            } finally { $fs.Close() }
+        }
+    } finally { $out.Close() }
+}
+
 function Test-UploadUrl([string]$raw) {
     if (-not $raw) { return $null }
     $t = $raw.Trim()
-    # Reponses HTML/SVG (ex. page d erreur) : ne JAMAIS extraire un faux lien
     if ($t -match '(?i)<!doctype|<html|<svg|xmlns=') { return $null }
 
     $line = ($t -split "`r?`n" | Where-Object { $_.Trim() -ne "" } | Select-Object -First 1)
@@ -444,7 +514,6 @@ function Test-UploadUrl([string]$raw) {
     }
 
     $u = $line.TrimEnd(".", ",", ")", "]", "`"", "'")
-    # Uniquement nos hebergeurs connus (evite http://www.w3.org/2000/svg ...)
     if ($u -notmatch '(?i)^https?://(litterbox\.catbox\.moe|files\.catbox\.moe|catbox\.moe|0x0\.st|file\.io|bashupload\.com|pixeldrain\.com)(/|$)') {
         return $null
     }
@@ -452,7 +521,7 @@ function Test-UploadUrl([string]$raw) {
     return $u
 }
 
-function Invoke-HostUpload([string]$name, [scriptblock]$attempt) {
+function Invoke-HostUpload([string]$name, [scriptblock]$attempt, [string]$okLabel = "") {
     for ($n = 1; $n -le 2; $n++) {
         if ($n -gt 1) {
             Write-Info ("Nouvelle tentative " + $name + " dans 3s...")
@@ -464,17 +533,15 @@ function Invoke-HostUpload([string]$name, [scriptblock]$attempt) {
             $raw = & $attempt
             $u = Test-UploadUrl ([string]$raw)
             if ($u) {
-                Write-Ok ("Pack envoye via " + $name + ".")
+                if ($okLabel) { Write-Ok $okLabel } else { Write-Ok ("Pack envoye via " + $name + ".") }
                 return [pscustomobject]@{ id = $u; url = $u; page = $u; host = $name }
             }
-            # file.io JSON
             try {
                 $json = ([string]$raw) | ConvertFrom-Json
                 if ($json.success -and $json.link) {
                     $u2 = Test-UploadUrl ([string]$json.link)
-                    if (-not $u2) { $u2 = $null }
                     if ($u2) {
-                        Write-Ok ("Pack envoye via " + $name + ".")
+                        if ($okLabel) { Write-Ok $okLabel } else { Write-Ok ("Pack envoye via " + $name + ".") }
                         return [pscustomobject]@{ id = $u2; url = $u2; page = $u2; host = $name }
                     }
                 }
@@ -487,58 +554,47 @@ function Invoke-HostUpload([string]$name, [scriptblock]$attempt) {
     return $null
 }
 
-function Send-PackFile([string]$zipPath) {
+function Send-OneFile([string]$filePath, [string]$okLabel = "") {
     $curl = Get-Curl
-    Write-Info "Envoi du pack (tu pourras fermer ensuite)..."
-    $sizeMb = [math]::Round((Get-Item -LiteralPath $zipPath).Length / 1MB, 1)
-    Write-Info ("Taille pack : " + $sizeMb + " Mo")
-    if ($sizeMb -gt 190) {
-        Write-Warn "Pack > 190 Mo : catbox risque d echouer - litterbox / 0x0 prioritaires."
-    }
+    $sizeMb = [math]::Round((Get-Item -LiteralPath $filePath).Length / 1MB, 1)
 
-    # Litterbox : jusqu a 1 Go, lien direct, expire 72h - ideal pour gros packs serveur
-    $up = Invoke-HostUpload "litterbox" {
-        & $curl -sS --connect-timeout 20 --max-time 600 -A "sync-collab" `
-            -F "reqtype=fileupload" -F "time=72h" -F "fileToUpload=@$zipPath" `
+    $up = Invoke-HostUpload -name "litterbox" -okLabel $okLabel -attempt {
+        & $curl -sS --connect-timeout 20 --max-time 900 -A "sync-collab" `
+            -F "reqtype=fileupload" -F "time=72h" -F "fileToUpload=@$filePath" `
             "https://litterbox.catbox.moe/resources/internals/api.php"
     }
     if ($up) { return $up }
 
-    # 0x0.st : simple, lien direct
-    $up = Invoke-HostUpload "0x0.st" {
-        & $curl -sS --connect-timeout 20 --max-time 600 -A "sync-collab" `
-            -F "file=@$zipPath" "https://0x0.st"
+    $up = Invoke-HostUpload -name "0x0.st" -okLabel $okLabel -attempt {
+        & $curl -sS --connect-timeout 20 --max-time 900 -A "sync-collab" `
+            -F "file=@$filePath" "https://0x0.st"
     }
     if ($up) { return $up }
 
-    # catbox permanent (max ~200 Mo)
     if ($sizeMb -le 190) {
-        $up = Invoke-HostUpload "catbox" {
-            & $curl -sS --connect-timeout 20 --max-time 600 -A "sync-collab" `
-                -F "reqtype=fileupload" -F "fileToUpload=@$zipPath" `
+        $up = Invoke-HostUpload -name "catbox" -okLabel $okLabel -attempt {
+            & $curl -sS --connect-timeout 20 --max-time 900 -A "sync-collab" `
+                -F "reqtype=fileupload" -F "fileToUpload=@$filePath" `
                 "https://catbox.moe/user/api.php"
         }
         if ($up) { return $up }
-    } else {
-        Write-Warn "catbox ignore (pack trop gros)."
     }
 
-    $up = Invoke-HostUpload "bashupload" {
-        & $curl -sS --connect-timeout 20 --max-time 600 -A "sync-collab" `
-            -T $zipPath "https://bashupload.com/serveur-pack.zip"
+    $up = Invoke-HostUpload -name "bashupload" -okLabel $okLabel -attempt {
+        & $curl -sS --connect-timeout 20 --max-time 900 -A "sync-collab" `
+            -T $filePath "https://bashupload.com/serveur-part.bin"
     }
     if ($up) { return $up }
 
-    $up = Invoke-HostUpload "file.io" {
-        & $curl -sS --connect-timeout 20 --max-time 600 -A "sync-collab" `
-            -F "file=@$zipPath" "https://file.io/?expires=2d"
+    $up = Invoke-HostUpload -name "file.io" -okLabel $okLabel -attempt {
+        & $curl -sS --connect-timeout 20 --max-time 900 -A "sync-collab" `
+            -F "file=@$filePath" "https://file.io/?expires=2d"
     }
     if ($up) { return $up }
 
-    # pixeldrain (API fichier)
-    $up = Invoke-HostUpload "pixeldrain" {
-        $raw = & $curl -sS --connect-timeout 20 --max-time 600 -A "sync-collab" `
-            -T $zipPath "https://pixeldrain.com/api/file/"
+    $up = Invoke-HostUpload -name "pixeldrain" -okLabel $okLabel -attempt {
+        $raw = & $curl -sS --connect-timeout 20 --max-time 900 -A "sync-collab" `
+            -T $filePath "https://pixeldrain.com/api/file/"
         try {
             $j = ([string]$raw) | ConvertFrom-Json
             if ($j.id) { return ("https://pixeldrain.com/api/file/" + $j.id + "?download") }
@@ -547,17 +603,131 @@ function Send-PackFile([string]$zipPath) {
     }
     if ($up) { return $up }
 
-    throw ("Echec upload (" + $sizeMb + " Mo) : tous les hebergeurs ont refuse. Verifie ta connexion / antivirus, ou envoie le zip a la mano (Discord/Drive) puis reessaie dans 2 minutes.")
+    return $null
+}
+
+# Packs > ce seuil : decoupage automatique (anti-ban / limites hebergeurs)
+$script:ChunkThresholdBytes = 40MB
+$script:ChunkPartBytes = 40MB
+
+function Send-PackFile([string]$zipPath) {
+    $size = (Get-Item -LiteralPath $zipPath).Length
+    $sizeMb = [math]::Round($size / 1MB, 1)
+    Write-Info "Envoi du pack (tu pourras fermer ensuite)..."
+    Write-Info ("Taille pack : " + $sizeMb + " Mo")
+
+    # Petit pack : un seul fichier
+    if ($size -le $script:ChunkThresholdBytes) {
+        $up = Send-OneFile $zipPath
+        if ($up) {
+            return [pscustomobject]@{
+                format    = "single"
+                id        = $up.url
+                url       = $up.url
+                page      = $up.url
+                host      = $up.host
+                code      = $null
+                indexUrl  = $null
+                partCount = 1
+                sha256    = (Get-FileSha256 $zipPath)
+            }
+        }
+        Write-Warn "Upload mono echoue - bascule en multi-parts..."
+    } else {
+        Write-Info ("Pack volumineux -> envoi en plusieurs morceaux (~" + [math]::Round($script:ChunkPartBytes/1MB) + " Mo).")
+    }
+
+    return Send-PackFileChunked $zipPath
+}
+
+function Send-PackFileChunked([string]$zipPath) {
+    $code = "MNC-" + ([guid]::NewGuid().ToString("N").Substring(0, 8).ToUpperInvariant())
+    $work = Join-Path $env:TEMP ("sync-parts-" + $code)
+    $partsMeta = New-Object System.Collections.Generic.List[object]
+    try {
+        if (Test-Path -LiteralPath $work) {
+            Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        New-Item -ItemType Directory -Path $work -Force | Out-Null
+
+        Write-Info ("Code envoi : " + $code)
+        Write-Info "Decoupage du zip..."
+        $partFiles = Split-FileToParts $zipPath $script:ChunkPartBytes $work
+        $total = $partFiles.Count
+        Write-Info ("Morceaux : " + $total)
+
+        $fullSha = Get-FileSha256 $zipPath
+        $i = 0
+        foreach ($pf in $partFiles) {
+            $i++
+            $label = ("Partie " + $i + "/" + $total + " (" + $code + ") envoyee.")
+            Write-Info ("--- Upload partie " + $i + "/" + $total + " ---")
+            $up = Send-OneFile $pf $label
+            if (-not $up) {
+                throw ("Echec upload partie " + $i + "/" + $total + ". Reessaie plus tard.")
+            }
+            $partsMeta.Add([pscustomobject]@{
+                i      = ($i - 1)
+                url    = $up.url
+                host   = $up.host
+                size   = (Get-Item -LiteralPath $pf).Length
+                sha256 = (Get-FileSha256 $pf)
+            })
+            if ($i -lt $total) { Start-Sleep -Seconds 2 }
+        }
+
+        # Petit index JSON (1 seul lien dans ntfy) = toutes les URLs des parts
+        $indexObj = [pscustomobject]@{
+            format    = "sync-collab-parts-v1"
+            code      = $code
+            name      = "serveur-pack.zip"
+            sizeBytes = (Get-Item -LiteralPath $zipPath).Length
+            partCount = $total
+            partSize  = [int64]$script:ChunkPartBytes
+            sha256    = $fullSha
+            parts     = $partsMeta
+        }
+        $indexPath = Join-Path $work ("index-" + $code + ".json")
+        [System.IO.File]::WriteAllText(
+            $indexPath,
+            ($indexObj | ConvertTo-Json -Depth 6 -Compress),
+            (New-Object System.Text.UTF8Encoding $false)
+        )
+        Write-Info "Upload de l index (plan des morceaux)..."
+        $idxUp = Send-OneFile $indexPath ("Index " + $code + " envoye.")
+        if (-not $idxUp) { throw "Echec upload de l index multi-parts." }
+
+        Write-Ok ("Pack multi-parts pret : " + $total + " morceaux, code " + $code)
+        return [pscustomobject]@{
+            format    = "sync-collab-parts-v1"
+            id        = $code
+            url       = $idxUp.url
+            page      = $idxUp.url
+            host      = $idxUp.host
+            code      = $code
+            indexUrl  = $idxUp.url
+            partCount = $total
+            sha256    = $fullSha
+            token     = $null
+        }
+    } finally {
+        try { Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue } catch { }
+    }
 }
 
 function Publish-Manifest($cfg, $up, $sizeBytes) {
     $channel = [string]$cfg.dropChannel
     if (-not $channel) { $channel = "syckoy-gmod-sync-collab" }
     $manifest = @{
+        format    = $(if ($up.format) { $up.format } else { "single" })
         id        = $up.id
         url       = $up.url
         page      = $up.page
         token     = $up.token
+        code      = $up.code
+        indexUrl  = $up.indexUrl
+        partCount = $up.partCount
+        sha256    = $up.sha256
         sentAt    = (Get-Date).ToString("o")
         sizeBytes = $sizeBytes
         name      = "serveur-pack.zip"
@@ -570,7 +740,6 @@ function Test-DirectPackUrl([string]$url) {
     if (-not $url) { return $false }
     if ($url -match "(?i)gofile\.io") { return $false }
     if ($url -match "(?i)w3\.org|\.svg") { return $false }
-    # Meme whitelist que l upload
     if ($url -notmatch '(?i)^https?://(litterbox\.catbox\.moe|files\.catbox\.moe|catbox\.moe|0x0\.st|file\.io|bashupload\.com|pixeldrain\.com)/') {
         return $false
     }
@@ -605,8 +774,11 @@ function Get-Manifest($cfg) {
                 $msg = [string]$ev.message
                 if ($msg.Trim().StartsWith("{")) {
                     $man = $msg | ConvertFrom-Json
-                    if ($man.url) {
-                        if (Test-DirectPackUrl ([string]$man.url)) {
+                    $u = $null
+                    if ($man.indexUrl) { $u = [string]$man.indexUrl }
+                    elseif ($man.url) { $u = [string]$man.url }
+                    if ($u) {
+                        if (Test-DirectPackUrl $u) {
                             $last = $man
                         } else {
                             $sawGofile = $true
@@ -632,6 +804,9 @@ function Invoke-Send {
         Write-Host ""
         Write-Ok "C est envoye. Tu peux FERMER le logiciel."
         Write-Host "L autre pourra recuperer plus tard, meme si tu n es plus la."
+        if ($up.code) {
+            Write-Host ("Code multi-parts : " + $up.code + " (" + $up.partCount + " morceaux)")
+        }
         Write-Host ("Lien (secours) : " + $up.page)
     } finally {
         try { Remove-Item -LiteralPath $pack.FullName -Force -ErrorAction SilentlyContinue } catch { }
@@ -869,22 +1044,97 @@ function Invoke-LegacyReceive($gmod, [string]$extract) {
     }
 }
 
+function Get-RemoteFile([string]$url, [string]$outPath) {
+    $curl = Get-Curl
+    & $curl -L --fail --connect-timeout 20 --max-time 900 -A "Mozilla/5.0" -o $outPath -- $url
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $outPath)) {
+        throw ("Telechargement echoue (curl " + $LASTEXITCODE + ") : " + $url)
+    }
+}
+
+function Receive-PackToZip($man, [string]$zipOut) {
+    $format = [string]$man.format
+    $indexUrl = $null
+    if ($man.indexUrl) { $indexUrl = [string]$man.indexUrl }
+    elseif ($format -eq "sync-collab-parts-v1" -and $man.url) { $indexUrl = [string]$man.url }
+
+    # Ancien format : 1 seul zip
+    if (-not $indexUrl -or $format -eq "single" -or (-not $format -and -not $man.partCount)) {
+        $url = [string]$man.url
+        if (-not (Test-DirectPackUrl $url)) {
+            throw "Lien invalide. Ton ami doit renvoyer avec sync a jour (bouton 2)."
+        }
+        Write-Info ("URL : " + $url)
+        Write-Info "Telechargement du pack..."
+        Get-RemoteFile $url $zipOut
+        return
+    }
+
+    # Multi-parts : telecharger l index puis chaque morceau
+    if (-not (Test-DirectPackUrl $indexUrl)) {
+        throw "Index multi-parts invalide. Ton ami doit renvoyer (bouton 2)."
+    }
+    $code = [string]$man.code
+    if (-not $code) { $code = "parts" }
+    Write-Ok ("Pack multi-parts detecte" + $(if ($code) { " : " + $code } else { "" }))
+    Write-Info ("Index : " + $indexUrl)
+
+    $work = Join-Path $env:TEMP ("sync-recv-" + $code + "-" + [guid]::NewGuid().ToString("N").Substring(0, 6))
+    New-Item -ItemType Directory -Path $work -Force | Out-Null
+    try {
+        $indexPath = Join-Path $work "index.json"
+        Get-RemoteFile $indexUrl $indexPath
+        $index = Get-Content -LiteralPath $indexPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        if (-not $index.parts -or $index.parts.Count -lt 1) {
+            throw "Index multi-parts vide ou corrompu."
+        }
+        $ordered = @($index.parts | Sort-Object { [int]$_.i })
+        Write-Info ("Morceaux a telecharger : " + $ordered.Count)
+        $partPaths = New-Object System.Collections.Generic.List[string]
+        $n = 0
+        foreach ($p in $ordered) {
+            $n++
+            $purl = [string]$p.url
+            if (-not (Test-DirectPackUrl $purl)) {
+                throw ("URL partie " + $n + " invalide : " + $purl)
+            }
+            $pp = Join-Path $work ("part-{0:D4}.bin" -f ([int]$p.i))
+            Write-Info ("Telechargement partie " + $n + "/" + $ordered.Count + "...")
+            Get-RemoteFile $purl $pp
+            if ($p.sha256) {
+                $got = Get-FileSha256 $pp
+                if ($got -ne [string]$p.sha256) {
+                    throw ("Hash partie " + $n + " incorrect (fichier corrompu).")
+                }
+            }
+            $partPaths.Add($pp)
+        }
+        Write-Info "Fusion des morceaux..."
+        Merge-FileParts ($partPaths.ToArray()) $zipOut
+        if ($index.sha256) {
+            $gotFull = Get-FileSha256 $zipOut
+            if ($gotFull -ne [string]$index.sha256) {
+                throw "Hash du zip reconstitue incorrect. Demande a ton ami de renvoyer."
+            }
+            Write-Ok "Integrite OK (sha256)."
+        }
+    } finally {
+        try { Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue } catch { }
+    }
+}
+
 function Invoke-Receive {
     $cfg = Get-Cfg
     Write-Info "Recherche de la derniere version envoyee..."
     $man = Get-Manifest $cfg
     Write-Ok ("Trouve : " + $man.sentAt)
-    Write-Info ("URL : " + $man.url)
-    if (-not (Test-DirectPackUrl ([string]$man.url))) {
-        throw "Lien invalide (envoi rate cote ami). Il doit mettre a jour sync puis renvoyer (2)."
+    if ($man.sizeBytes) {
+        Write-Info ("Taille annoncee : {0:N1} Mo" -f ($man.sizeBytes / 1MB))
     }
+
     $zip = Join-Path $env:TEMP ("serveur-recv-" + [guid]::NewGuid().ToString("N") + ".zip")
-    $curl = Get-Curl
-    Write-Info "Telechargement du pack..."
-    & $curl -L --fail --connect-timeout 20 --max-time 600 -A "Mozilla/5.0" -o $zip -- $man.url
-    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $zip)) {
-        throw ("Telechargement echoue (curl " + $LASTEXITCODE + "). URL : " + $man.url + " - demande a ton ami de renvoyer.")
-    }
+    Receive-PackToZip $man $zip
+
     if (-not (Test-ZipFile $zip)) {
         throw "Le fichier telecharge n est pas un zip. Demande a ton ami de renvoyer avec la nouvelle version (bouton 2)."
     }

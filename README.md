@@ -13,6 +13,11 @@ La recuperation compare automatiquement :
 Le pack prend tout le custom dans garrysmod (addons, cfg, gamemodes, data, settings, etc.)
 et les dossiers a cote (ex: addon-post). Pas les maps / cache / VPK.
 
+Envoi gros packs (v2.1+) :
+  - au-dela de ~40 Mo, le zip est decoupe en morceaux (~40 Mo)
+  - chaque morceau est uploade separement (code MNC-XXXXXXXX)
+  - a la reception, tous les morceaux sont retelecharges, fusionnes, puis appliques
+
 Pour GitHub : uploader UNIQUEMENT les fichiers de CE dossier
 (sync.bat, sync.ps1, config.json, version.json, README.md, .gitignore)
 a la racine du repo, sans sous-dossier.
