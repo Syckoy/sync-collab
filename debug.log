@@ -1,0 +1,6 @@
+2026-09-20 | BOOTSTRAP debug.log created by agent after v2.4.0 direct-sync impl
+2026-09-20 | SMOKE TCP loopback: OK (512KB transfer + SHA256 match)
+2026-09-20 | SELF-DEBUG ports 27890-27902: all libre
+2026-09-20 | SELF-DEBUG IPs seen: 192.168.1.48 + 26.x (VPN/tunnel)
+2026-09-20 | PARSE sync.ps1: OK
+2026-09-20 | NOTE: Git not in PATH at build time; winget Git install may need admin. Push GitHub Syckoy/sync-collab manually if auto-update needed for friend.
