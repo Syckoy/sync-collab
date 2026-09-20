@@ -429,9 +429,27 @@ function Get-ShortErr([string]$s) {
 
 function Test-UploadUrl([string]$raw) {
     if (-not $raw) { return $null }
-    $m = [regex]::Match($raw.Trim(), 'https?://\S+')
-    if (-not $m.Success) { return $null }
-    return $m.Value.Trim().TrimEnd(".", ",", ")", "]")
+    $t = $raw.Trim()
+    # Reponses HTML/SVG (ex. page d erreur) : ne JAMAIS extraire un faux lien
+    if ($t -match '(?i)<!doctype|<html|<svg|xmlns=') { return $null }
+
+    $line = ($t -split "`r?`n" | Where-Object { $_.Trim() -ne "" } | Select-Object -First 1)
+    if (-not $line) { return $null }
+    $line = $line.Trim()
+
+    if ($line -notmatch '^https?://') {
+        $m = [regex]::Match($t, 'https?://[^\s\"''<>]+')
+        if (-not $m.Success) { return $null }
+        $line = $m.Value
+    }
+
+    $u = $line.TrimEnd(".", ",", ")", "]", "`"", "'")
+    # Uniquement nos hebergeurs connus (evite http://www.w3.org/2000/svg ...)
+    if ($u -notmatch '(?i)^https?://(litterbox\.catbox\.moe|files\.catbox\.moe|catbox\.moe|0x0\.st|file\.io|bashupload\.com|pixeldrain\.com)(/|$)') {
+        return $null
+    }
+    if ($u -match '(?i)w3\.org|\.svg(\?|$)') { return $null }
+    return $u
 }
 
 function Invoke-HostUpload([string]$name, [scriptblock]$attempt) {
@@ -453,9 +471,12 @@ function Invoke-HostUpload([string]$name, [scriptblock]$attempt) {
             try {
                 $json = ([string]$raw) | ConvertFrom-Json
                 if ($json.success -and $json.link) {
-                    $u2 = [string]$json.link
-                    Write-Ok ("Pack envoye via " + $name + ".")
-                    return [pscustomobject]@{ id = $u2; url = $u2; page = $u2; host = $name }
+                    $u2 = Test-UploadUrl ([string]$json.link)
+                    if (-not $u2) { $u2 = $null }
+                    if ($u2) {
+                        Write-Ok ("Pack envoye via " + $name + ".")
+                        return [pscustomobject]@{ id = $u2; url = $u2; page = $u2; host = $name }
+                    }
                 }
             } catch { }
             Write-Warn ($name + " : " + (Get-ShortErr ([string]$raw)))
@@ -548,6 +569,11 @@ function Publish-Manifest($cfg, $up, $sizeBytes) {
 function Test-DirectPackUrl([string]$url) {
     if (-not $url) { return $false }
     if ($url -match "(?i)gofile\.io") { return $false }
+    if ($url -match "(?i)w3\.org|\.svg") { return $false }
+    # Meme whitelist que l upload
+    if ($url -notmatch '(?i)^https?://(litterbox\.catbox\.moe|files\.catbox\.moe|catbox\.moe|0x0\.st|file\.io|bashupload\.com|pixeldrain\.com)/') {
+        return $false
+    }
     return $true
 }
 
@@ -594,7 +620,7 @@ function Get-Manifest($cfg) {
     if ($sawGofile) {
         throw "L envoi de ton ami est encore sur Gofile (page web, pas un vrai fichier). Demande-lui de relancer sync.bat, accepter la maj, puis ENVOYER (2)."
     }
-    throw "Manifest invalide. L autre doit renvoyer une version."
+    throw "Aucun lien d upload valide. L envoi de ton ami a echoue (faux lien). Demande-lui de mettre a jour sync.ps1 puis de renvoyer (bouton 2)."
 }
 
 function Invoke-Send {
@@ -848,11 +874,17 @@ function Invoke-Receive {
     Write-Info "Recherche de la derniere version envoyee..."
     $man = Get-Manifest $cfg
     Write-Ok ("Trouve : " + $man.sentAt)
+    Write-Info ("URL : " + $man.url)
+    if (-not (Test-DirectPackUrl ([string]$man.url))) {
+        throw "Lien invalide (envoi rate cote ami). Il doit mettre a jour sync puis renvoyer (2)."
+    }
     $zip = Join-Path $env:TEMP ("serveur-recv-" + [guid]::NewGuid().ToString("N") + ".zip")
     $curl = Get-Curl
     Write-Info "Telechargement du pack..."
-    & $curl -L --fail -A "Mozilla/5.0" -o $zip $man.url
-    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $zip)) { throw "Telechargement echoue." }
+    & $curl -L --fail --connect-timeout 20 --max-time 600 -A "Mozilla/5.0" -o $zip -- $man.url
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $zip)) {
+        throw ("Telechargement echoue (curl " + $LASTEXITCODE + "). URL : " + $man.url + " - demande a ton ami de renvoyer.")
+    }
     if (-not (Test-ZipFile $zip)) {
         throw "Le fichier telecharge n est pas un zip. Demande a ton ami de renvoyer avec la nouvelle version (bouton 2)."
     }
