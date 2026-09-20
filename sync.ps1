@@ -966,9 +966,82 @@ function Write-ReceiveLog([string]$msg) {
     } catch { }
 }
 
-function Get-Manifest($cfg) {
+function Get-NtfyChannel($cfg) {
     $channel = [string]$cfg.dropChannel
     if (-not $channel) { $channel = "syckoy-gmod-sync-collab" }
+    return $channel
+}
+
+function Publish-DirectPresence($cfg, [string[]]$ips, [int]$port, [int64]$sizeBytes) {
+    $channel = Get-NtfyChannel $cfg
+    $payload = @{
+        format    = "direct-presence"
+        magic     = "DIRECTCOLLAB"
+        name      = $env:COMPUTERNAME
+        ips       = @($ips)
+        port      = $port
+        ports     = @($script:DirectPorts)
+        sizeBytes = $sizeBytes
+        sentAt    = (Get-Date).ToString("o")
+        version   = [string](Read-JsonFile $VersionPath).version
+    } | ConvertTo-Json -Compress
+    $body = "DIRECTCOLLAB|" + $payload
+    $uri = "https://ntfy.sh/" + $channel
+    try {
+        Invoke-RestMethod -Method POST -Uri $uri -Body $body -ContentType "text/plain; charset=utf-8" -TimeoutSec 15 | Out-Null
+        Write-DebugLog "presence published channel=$channel port=$port ips=$($ips -join ',')"
+        return $true
+    } catch {
+        Write-DebugLog "presence publish fail: $($_.Exception.Message)"
+        return $false
+    }
+}
+
+function Get-DirectPresenceList($cfg) {
+    $channel = Get-NtfyChannel $cfg
+    $curl = Get-Curl
+    $uri = "https://ntfy.sh/" + $channel + "/json?poll=1"
+    $found = New-Object System.Collections.Generic.List[object]
+    try {
+        $raw = & $curl -sS -A "sync-collab" --max-time 20 $uri 2>$null
+        if ($LASTEXITCODE -ne 0 -or -not $raw) { return @() }
+        $cutoff = (Get-Date).AddMinutes(-20)
+        foreach ($line in ($raw -split "`n" | Where-Object { $_.Trim() -ne "" })) {
+            try {
+                $ev = $line | ConvertFrom-Json
+                $msg = [string]$ev.message
+                if (-not $msg) { continue }
+                $json = $null
+                if ($msg.StartsWith("DIRECTCOLLAB|")) {
+                    $json = $msg.Substring("DIRECTCOLLAB|".Length)
+                } elseif ($msg.Trim().StartsWith("{") -and $msg -match '"direct-presence"') {
+                    $json = $msg
+                } else { continue }
+                $p = $json | ConvertFrom-Json
+                if ([string]$p.format -ne "direct-presence") { continue }
+                $when = $null
+                try { $when = [datetime]::Parse([string]$p.sentAt) } catch { }
+                if ($when -and $when -lt $cutoff) { continue }
+                $ipList = @()
+                if ($p.ips) { $ipList = @($p.ips | ForEach-Object { [string]$_ }) }
+                $found.Add([pscustomobject]@{
+                    Name = [string]$p.name
+                    Ips  = $ipList
+                    Port = [int]$p.port
+                    Size = [int64]$p.sizeBytes
+                    At   = [string]$p.sentAt
+                }) | Out-Null
+            } catch { }
+        }
+    } catch {
+        Write-DebugLog "presence poll fail: $($_.Exception.Message)"
+    }
+    # plus recent en premier
+    return @($found | Sort-Object At -Descending)
+}
+
+function Get-Manifest($cfg) {
+    $channel = Get-NtfyChannel $cfg
     $curl = Get-Curl
     $uri = "https://ntfy.sh/" + $channel + "/json?poll=1"
     $raw = & $curl -sS -A "sync-collab" $uri
@@ -981,8 +1054,10 @@ function Get-Manifest($cfg) {
             $ev = $line | ConvertFrom-Json
             if ($ev.message) {
                 $msg = [string]$ev.message
+                if ($msg.StartsWith("DIRECTCOLLAB|")) { continue }
                 if ($msg.Trim().StartsWith("{")) {
                     $man = $msg | ConvertFrom-Json
+                    if ([string]$man.format -eq "direct-presence") { continue }
                     $u = $null
                     if ($man.indexUrl) { $u = [string]$man.indexUrl }
                     elseif ($man.url) { $u = [string]$man.url }
@@ -1381,17 +1456,493 @@ function Invoke-Receive {
     Write-Host "Tes autres dossiers non presents dans le pack sont INTACTS."
 }
 
+# --- Debug + connexion directe (option 3) ---
+
+$script:DirectPorts = @(27890, 27891, 27892, 27901, 27902)
+$script:DiscoverPort = 27999
+
+function Write-DebugLog([string]$msg) {
+    try {
+        $log = Join-Path $Root "debug.log"
+        $line = "{0} | {1}" -f (Get-Date).ToString("yyyy-MM-dd HH:mm:ss.fff"), $msg
+        Add-Content -LiteralPath $log -Value $line -Encoding UTF8
+    } catch { }
+}
+
+function Invoke-SelfDebug {
+    Write-DebugLog "==== SELF-DEBUG START v$((Read-JsonFile $VersionPath).version) ===="
+    $issues = New-Object System.Collections.Generic.List[string]
+    $oks = New-Object System.Collections.Generic.List[string]
+
+    try {
+        $curl = Get-Curl
+        $oks.Add("curl OK: $curl")
+        Write-DebugLog $oks[$oks.Count - 1]
+    } catch {
+        $issues.Add("curl manquant")
+        Write-DebugLog "ERR curl: $($_.Exception.Message)"
+    }
+
+    try {
+        $cfg = Get-Cfg
+        $oks.Add("config.json OK channel=$($cfg.dropChannel)")
+        Write-DebugLog $oks[$oks.Count - 1]
+        $gmod = Find-GmodDir $cfg
+        $oks.Add("garrysmod OK: $($gmod.FullName)")
+        Write-DebugLog $oks[$oks.Count - 1]
+    } catch {
+        $issues.Add("config/gmod: $($_.Exception.Message)")
+        Write-DebugLog "ERR gmod: $($_.Exception.Message)"
+    }
+
+    # Ports libres ?
+    foreach ($p in $script:DirectPorts) {
+        $l = $null
+        try {
+            $l = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Any, $p)
+            $l.Start()
+            $oks.Add("port $p libre")
+            Write-DebugLog "port $p libre"
+            $l.Stop()
+        } catch {
+            $issues.Add("port $p occupe/bloque")
+            Write-DebugLog "WARN port $p : $($_.Exception.Message)"
+            try { if ($l) { $l.Stop() } } catch { }
+        }
+    }
+
+    # IPs locales
+    try {
+        $ips = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+            Where-Object { $_.IPAddress -notlike "127.*" -and $_.PrefixOrigin -ne "WellKnown" } |
+            Select-Object -ExpandProperty IPAddress -Unique)
+        if (-not $ips -or $ips.Count -eq 0) {
+            $ips = @([System.Net.Dns]::GetHostAddresses($env:COMPUTERNAME) |
+                Where-Object { $_.AddressFamily -eq "InterNetwork" -and $_.ToString() -notlike "127.*" } |
+                ForEach-Object { $_.ToString() })
+        }
+        Write-DebugLog ("IPs locales: " + ($ips -join ", "))
+        $oks.Add("IPs: " + ($ips -join ", "))
+    } catch {
+        Write-DebugLog "WARN IPs: $($_.Exception.Message)"
+    }
+
+    Write-DebugLog ("SELF-DEBUG done oks=$($oks.Count) issues=$($issues.Count)")
+    if ($issues.Count -gt 0) {
+        Write-Warn ("Auto-debug: " + ($issues -join " | "))
+        Write-Host ("Details: " + (Join-Path $Root "debug.log")) -ForegroundColor DarkGray
+    } else {
+        Write-Ok "Auto-debug OK (voir debug.log)."
+    }
+}
+
+function Get-LanIPv4List {
+    $ips = @()
+    try {
+        $ips = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+            Where-Object {
+                $_.IPAddress -notlike "127.*" -and
+                $_.IPAddress -notlike "169.254.*" -and
+                $_.PrefixOrigin -ne "WellKnown"
+            } | Select-Object -ExpandProperty IPAddress -Unique)
+    } catch { }
+    if ($ips.Count -eq 0) {
+        try {
+            $ips = @([System.Net.Dns]::GetHostAddresses([System.Net.Dns]::GetHostName()) |
+                Where-Object { $_.AddressFamily -eq "InterNetwork" } |
+                ForEach-Object { $_.ToString() } |
+                Where-Object { $_ -notlike "127.*" -and $_ -notlike "169.254.*" })
+        } catch { }
+    }
+    return @($ips)
+}
+
+function Try-AddFirewallRule([int]$port) {
+    try {
+        $name = "SyncCollab-Direct-$port"
+        $existing = netsh advfirewall firewall show rule name="$name" 2>$null
+        if ($existing -match $name) { return $true }
+        $r = Start-Process -FilePath "netsh" -ArgumentList @(
+            "advfirewall", "firewall", "add", "rule",
+            "name=$name", "dir=in", "action=allow", "protocol=TCP", "localport=$port"
+        ) -Wait -PassThru -WindowStyle Hidden
+        Write-DebugLog ("firewall port $port exit=$($r.ExitCode)")
+        return ($r.ExitCode -eq 0)
+    } catch {
+        Write-DebugLog ("firewall fail: $($_.Exception.Message)")
+        return $false
+    }
+}
+
+function Apply-PackZipFile([string]$zipPath) {
+    if (-not (Test-ZipFile $zipPath)) { throw "Zip invalide. RIEN modifie." }
+    $extract = Join-Path $env:TEMP ("serveur-direct-" + [guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Path $extract | Out-Null
+    try {
+        Expand-Utf8Zip $zipPath $extract
+        $index = Read-PackIndex $extract
+        if (-not $index -or $index.format -ne "sync-collab-v2") {
+            throw "Pack sans index v2. RIEN modifie."
+        }
+        $nFiles = @($index.files).Count
+        if ($nFiles -lt 1) { throw "Pack vide. RIEN modifie." }
+        Write-Ok ("Pack valide : $nFiles fichiers")
+        $cfg = Get-Cfg
+        $gmod = Find-GmodDir $cfg
+        $backupPath = Backup-LocalBeforeReceive $cfg $gmod
+        Invoke-MirrorPack $cfg $gmod $index $extract
+        try { Save-TreeDoc $index (Join-Path $Root ".dernier-arbre.txt") } catch { }
+        Write-ReceiveLog ("DIRECT-RECV ok files=$nFiles backup=$backupPath")
+        Write-DebugLog "DIRECT apply OK files=$nFiles"
+        Write-Ok "Fusion terminee (aucune suppression)."
+        Write-Host ("Backup : " + $backupPath)
+    } finally {
+        try { Remove-Item -LiteralPath $extract -Recurse -Force -ErrorAction SilentlyContinue } catch { }
+    }
+}
+
+function Send-TcpPack([System.Net.Sockets.TcpClient]$client, [string]$zipPath, $meta) {
+    $stream = $client.GetStream()
+    $metaLine = "SYNCCOLLAB2|" + ($meta | ConvertTo-Json -Compress) + "`n"
+    $metaBytes = [System.Text.Encoding]::UTF8.GetBytes($metaLine)
+    $stream.Write($metaBytes, 0, $metaBytes.Length)
+    $stream.Flush()
+
+    $fs = [System.IO.File]::OpenRead($zipPath)
+    try {
+        $buf = New-Object byte[] (1024 * 256)
+        $sent = [int64]0
+        $total = $fs.Length
+        $start = Get-Date
+        while (($read = $fs.Read($buf, 0, $buf.Length)) -gt 0) {
+            $stream.Write($buf, 0, $read)
+            $sent += $read
+            $pct = [math]::Round(100.0 * $sent / $total, 1)
+            $mb = [math]::Round($sent / 1MB, 1)
+            $elapsed = ((Get-Date) - $start).TotalSeconds
+            $speed = if ($elapsed -gt 0.2) { [math]::Round(($sent / 1MB) / $elapsed, 1) } else { 0 }
+            Write-Host ("`r  Envoi direct [{0}%] {1} Mo / {2:N1} Mo | {3} Mo/s   " -f $pct, $mb, ($total/1MB), $speed) -NoNewline
+        }
+        $stream.Flush()
+        Write-Host ""
+    } finally { $fs.Close() }
+}
+
+function Receive-TcpPack([System.Net.Sockets.TcpClient]$client, [string]$outZip) {
+    $stream = $client.GetStream()
+    $stream.ReadTimeout = 120000
+    # Lire header jusqu au \n
+    $ms = New-Object System.IO.MemoryStream
+    while ($true) {
+        $b = $stream.ReadByte()
+        if ($b -lt 0) { throw "Connexion coupee (header)." }
+        if ($b -eq 10) { break } # \n
+        if ($b -ne 13) { $ms.WriteByte([byte]$b) }
+        if ($ms.Length -gt 200000) { throw "Header trop long." }
+    }
+    $header = [System.Text.Encoding]::UTF8.GetString($ms.ToArray())
+    if ($header -notlike "SYNCCOLLAB2|*") { throw "Protocole inconnu: $header" }
+    $json = $header.Substring("SYNCCOLLAB2|".Length)
+    $meta = $json | ConvertFrom-Json
+    $total = [int64]$meta.sizeBytes
+    if ($total -le 0) { throw "Taille invalide." }
+    Write-Info ("Reception : {0:N1} Mo (sha {1}...)" -f ($total/1MB), ([string]$meta.sha256).Substring(0, [Math]::Min(8, ([string]$meta.sha256).Length)))
+
+    $fs = [System.IO.File]::Create($outZip)
+    try {
+        $buf = New-Object byte[] (1024 * 256)
+        $got = [int64]0
+        $start = Get-Date
+        while ($got -lt $total) {
+            $want = [int][Math]::Min($buf.Length, $total - $got)
+            $read = $stream.Read($buf, 0, $want)
+            if ($read -le 0) { throw "Connexion coupee au milieu du transfert." }
+            $fs.Write($buf, 0, $read)
+            $got += $read
+            $pct = [math]::Round(100.0 * $got / $total, 1)
+            $mb = [math]::Round($got / 1MB, 1)
+            $elapsed = ((Get-Date) - $start).TotalSeconds
+            $speed = if ($elapsed -gt 0.2) { [math]::Round(($got / 1MB) / $elapsed, 1) } else { 0 }
+            Write-Host ("`r  Recu [{0}%] {1} Mo | {2} Mo/s   " -f $pct, $mb, $speed) -NoNewline
+        }
+        Write-Host ""
+    } finally { $fs.Close() }
+
+    if ($meta.sha256) {
+        $h = Get-FileSha256 $outZip
+        if ($h -ne [string]$meta.sha256) { throw "Hash direct incorrect. Abandon (rien fusionne)." }
+        Write-Ok "Hash OK."
+    }
+    return $meta
+}
+
+function Start-DirectHost {
+    $cfg = Get-Cfg
+    Write-Host ""
+    Write-Host "=== DIRECT : HEBERGER (envoyer maintenant) ===" -ForegroundColor Magenta
+    Write-DebugLog "DIRECT HOST start"
+
+    Write-Info "Compression du pack (comme un envoi normal)..."
+    $pack = New-ServerPack $cfg
+    $idx = Assert-PackZipReady $pack.FullName
+    $sha = Get-FileSha256 $pack.FullName
+    $meta = @{
+        magic     = "SYNCCOLLAB2"
+        version   = [string](Read-JsonFile $VersionPath).version
+        sizeBytes = [int64]$pack.Length
+        sha256    = $sha
+        fileCount = @($idx.files).Count
+        name      = $env:COMPUTERNAME
+        sentAt    = (Get-Date).ToString("o")
+    }
+
+    $listener = $null
+    $boundPort = 0
+    foreach ($p in $script:DirectPorts) {
+        try {
+            $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Any, $p)
+            $listener.Start()
+            $boundPort = $p
+            [void](Try-AddFirewallRule $p)
+            Write-DebugLog "LISTEN OK port=$p"
+            break
+        } catch {
+            Write-DebugLog "LISTEN fail port=$p : $($_.Exception.Message)"
+            try { if ($listener) { $listener.Stop() } } catch { }
+            $listener = $null
+        }
+    }
+    if (-not $listener) {
+        throw "Aucun port libre parmi: $($script:DirectPorts -join ', '). Ferme un logiciel ou autorise le pare-feu."
+    }
+
+    $ips = Get-LanIPv4List
+    Write-Ok ("En ecoute sur le port $boundPort")
+    Write-Host "Dis a l autre de choisir option 3 -> Se connecter"
+    Write-Host "IP(s) a entrer chez lui :" -ForegroundColor Yellow
+    foreach ($ip in $ips) { Write-Host ("   $ip") -ForegroundColor Yellow }
+    if ($ips.Count -eq 0) { Write-Warn "IP locale introuvable - donne ton IP Windows (ipconfig)." }
+    Write-Info "Signalement session (ntfy) pour que l autre te trouve auto..."
+    if (Publish-DirectPresence $cfg $ips $boundPort ([int64]$pack.Length)) {
+        Write-Ok "Session annoncee. L autre peut juste faire 3 -> C."
+    } else {
+        Write-Warn "Signalement ntfy rate - il devra taper ton IP manuellement."
+    }
+    Write-Host "Attente de connexion (Ctrl+C pour annuler)..."
+    Write-DebugLog ("HOST waiting ips=$($ips -join ',') port=$boundPort size=$($pack.Length)")
+
+    # Discovery UDP en parallele (job leger)
+    $discover = $null
+    try {
+        $discover = Start-Job -ScriptBlock {
+            param($port, $tcpPort, $name)
+            $udp = New-Object System.Net.Sockets.UdpClient
+            try {
+                $udp.Client.SetSocketOption([System.Net.Sockets.SocketOptionLevel]::Socket, [System.Net.Sockets.SocketOptionName]::ReuseAddress, $true)
+                $udp.Client.Bind([System.Net.IPEndPoint]::new([System.Net.IPAddress]::Any, $port))
+                $remote = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Any, 0)
+                while ($true) {
+                    $bytes = $udp.Receive([ref]$remote)
+                    $msg = [System.Text.Encoding]::UTF8.GetString($bytes)
+                    if ($msg -like "SYNCOLLAB-DISC*") {
+                        $reply = [System.Text.Encoding]::UTF8.GetBytes("SYNCOLLAB-HERE|$tcpPort|$name")
+                        $udp.Send($reply, $reply.Length, $remote) | Out-Null
+                    }
+                }
+            } finally { $udp.Close() }
+        } -ArgumentList $script:DiscoverPort, $boundPort, $env:COMPUTERNAME
+    } catch {
+        Write-DebugLog "discover job fail: $($_.Exception.Message)"
+    }
+
+    try {
+        $client = $listener.AcceptTcpClient()
+        $ep = $client.Client.RemoteEndPoint.ToString()
+        Write-Ok ("Connecte : $ep")
+        Write-DebugLog "HOST accepted $ep"
+        Write-Info "Transfert direct..."
+        Send-TcpPack $client $pack.FullName $meta
+        $client.Close()
+        Write-Ok "ENVOI DIRECT TERMINE."
+        Write-ReceiveLog "DIRECT-SEND ok to=$ep size=$($pack.Length)"
+        Write-DebugLog "HOST send done"
+    } finally {
+        try { $listener.Stop() } catch { }
+        if ($discover) {
+            try { Stop-Job $discover -Force; Remove-Job $discover -Force } catch { }
+        }
+        try { Remove-Item -LiteralPath $pack.FullName -Force -ErrorAction SilentlyContinue } catch { }
+    }
+}
+
+function Find-DirectHosts {
+    $found = @{}
+    # 1) Presence ntfy (meme canal) - marche meme sans broadcast UDP
+    try {
+        Write-Info "Recherche session annoncee (ntfy)..."
+        $cfg = Get-Cfg
+        foreach ($p in (Get-DirectPresenceList $cfg)) {
+            foreach ($ip in @($p.Ips)) {
+                if (-not $ip) { continue }
+                $key = "$ip`:$($p.Port)"
+                $found[$key] = [pscustomobject]@{ Ip = $ip; Port = [int]$p.Port; Name = $p.Name; Via = "ntfy" }
+            }
+        }
+        Write-DebugLog ("presence hits=" + $found.Count)
+    } catch {
+        Write-DebugLog "presence search fail: $($_.Exception.Message)"
+    }
+
+    # 2) Broadcast LAN UDP
+    Write-Info "Recherche LAN (2s)..."
+    try {
+        $udp = New-Object System.Net.Sockets.UdpClient
+        $udp.EnableBroadcast = $true
+        $udp.Client.ReceiveTimeout = 800
+        $data = [System.Text.Encoding]::UTF8.GetBytes("SYNCOLLAB-DISC?")
+        $udp.Send($data, $data.Length, [System.Net.IPEndPoint]::new([System.Net.IPAddress]::Broadcast, $script:DiscoverPort)) | Out-Null
+        foreach ($ip in (Get-LanIPv4List)) {
+            try {
+                $parts = $ip.Split(".")
+                if ($parts.Count -eq 4) {
+                    $bcast = "$($parts[0]).$($parts[1]).$($parts[2]).255"
+                    $udp.Send($data, $data.Length, [System.Net.IPEndPoint]::new([System.Net.IPAddress]::Parse($bcast), $script:DiscoverPort)) | Out-Null
+                }
+            } catch { }
+        }
+        $deadline = (Get-Date).AddSeconds(2.5)
+        while ((Get-Date) -lt $deadline) {
+            try {
+                $remote = New-Object System.Net.IPEndPoint([System.Net.IPAddress]::Any, 0)
+                $bytes = $udp.Receive([ref]$remote)
+                $msg = [System.Text.Encoding]::UTF8.GetString($bytes)
+                if ($msg -like "SYNCOLLAB-HERE|*") {
+                    $bits = $msg.Split("|")
+                    $key = $remote.Address.ToString() + ":" + $bits[1]
+                    $found[$key] = [pscustomobject]@{ Ip = $remote.Address.ToString(); Port = [int]$bits[1]; Name = $bits[2]; Via = "lan" }
+                }
+            } catch { break }
+        }
+        $udp.Close()
+    } catch {
+        Write-DebugLog "discover client fail: $($_.Exception.Message)"
+    }
+    return @($found.Values)
+}
+
+function Start-DirectClient {
+    Write-Host ""
+    Write-Host "=== DIRECT : SE CONNECTER (recuperer maintenant) ===" -ForegroundColor Magenta
+    Write-DebugLog "DIRECT CLIENT start"
+
+    $hosts = Find-DirectHosts
+    $ip = $null
+    $portHint = $null
+    $tryIps = New-Object System.Collections.Generic.List[string]
+    if ($hosts.Count -gt 0) {
+        Write-Ok ("Session(s) trouvee(s) :")
+        $i = 1
+        foreach ($h in $hosts) {
+            Write-Host ("  $i) $($h.Name) @ $($h.Ip):$($h.Port) [$($h.Via)]")
+            $i++
+        }
+        $c = Read-Host "Numero (ou Entree = essayer TOUTES auto / ou tape une IP)"
+        if ($c -match '^\d+$') {
+            $n = [int]$c
+            if ($n -ge 1 -and $n -le $hosts.Count) {
+                $ip = $hosts[$n - 1].Ip
+                $portHint = $hosts[$n - 1].Port
+            }
+        } elseif (-not $c) {
+            foreach ($h in $hosts) {
+                if (-not $tryIps.Contains($h.Ip)) { $tryIps.Add($h.Ip) | Out-Null }
+                if (-not $portHint) { $portHint = $h.Port }
+            }
+        } else {
+            $ip = $c.Trim()
+        }
+    }
+    if (-not $ip -and $tryIps.Count -eq 0) {
+        $ip = Read-Host "IP de l autre (ex 192.168.1.42)"
+    }
+    if ($ip) { $tryIps.Clear(); $tryIps.Add($ip) | Out-Null }
+    if ($tryIps.Count -eq 0) { throw "IP manquante." }
+
+    $ports = @()
+    if ($portHint) { $ports += $portHint }
+    $ports += $script:DirectPorts
+    $ports = @($ports | Select-Object -Unique)
+
+    $client = $null
+    $usedPort = 0
+    $usedIp = $null
+    :connectOuter foreach ($candIp in $tryIps) {
+        foreach ($p in $ports) {
+            try {
+                Write-Info ("Connexion $($candIp):$p ...")
+                $client = New-Object System.Net.Sockets.TcpClient
+                $iar = $client.BeginConnect($candIp, $p, $null, $null)
+                $ok = $iar.AsyncWaitHandle.WaitOne(3000, $false)
+                if (-not $ok) { $client.Close(); $client = $null; continue }
+                $client.EndConnect($iar)
+                $usedPort = $p
+                $usedIp = $candIp
+                Write-Ok ("Connecte sur $($candIp):$p")
+                Write-DebugLog "CLIENT connected $candIp`:$p"
+                break connectOuter
+            } catch {
+                Write-DebugLog "CLIENT fail $candIp`:$p : $($_.Exception.Message)"
+                try { if ($client) { $client.Close() } } catch { }
+                $client = $null
+            }
+        }
+    }
+    if (-not $client) {
+        throw "Impossible de joindre ($($tryIps -join ', ')) ports $($ports -join ', '). Verifiez: meme WiFi / VPN, Heberger lance chez lui, pare-feu Windows."
+    }
+
+    $zip = Join-Path $env:TEMP ("serveur-direct-recv-" + [guid]::NewGuid().ToString("N") + ".zip")
+    try {
+        $meta = Receive-TcpPack $client $zip
+        $client.Close()
+        Write-Info "Application du pack (fusion + backup)..."
+        Apply-PackZipFile $zip
+        Write-Ok "RECUPERATION DIRECTE TERMINEE."
+        Write-DebugLog "CLIENT done from=$usedIp`:$usedPort files=$($meta.fileCount)"
+    } finally {
+        try { if ($client) { $client.Close() } } catch { }
+        try { Remove-Item -LiteralPath $zip -Force -ErrorAction SilentlyContinue } catch { }
+    }
+}
+
+function Invoke-DirectMenu {
+    Write-Host ""
+    Write-Host "=== CONNEXION DIRECTE (rapide, les deux presents) ===" -ForegroundColor Magenta
+    Write-Host "  H) Heberger  = TOI envoies ton serveur maintenant"
+    Write-Host "  C) Connecter = TOI recuperes depuis l autre maintenant"
+    Write-Host "  0) Retour"
+    Write-Host ""
+    $c = Read-Host "Choix"
+    if ($c -match '^[hH]') { Start-DirectHost }
+    elseif ($c -match '^[cC]') { Start-DirectClient }
+    elseif ($c -eq "0") { return }
+    else { Write-Warn "Choix invalide." }
+}
+
 function Show-Menu {
     Clear-Host
     Write-Host "==============================================" -ForegroundColor Magenta
     Write-Host "  SYNC COLLAB" -ForegroundColor Magenta
     Write-Host "=============================================="
     Write-Host ""
-    Write-Host "  1) RECUPERER"
-    Write-Host "     Fusion + backup auto (ne supprime rien)"
+    Write-Host "  1) RECUPERER (messager - l autre peut etre parti)"
+    Write-Host "     Fusion + backup auto"
     Write-Host ""
-    Write-Host "  2) ENVOYER"
-    Write-Host "     Pack verifie + lien reteste avant publication"
+    Write-Host "  2) ENVOYER (messager - pour plus tard)"
+    Write-Host "     Pack verifie + lien reteste"
+    Write-Host ""
+    Write-Host "  3) DIRECT (les DEUX sont la - rapide)"
+    Write-Host "     Connexion TCP locale / IP, multi-ports"
     Write-Host ""
     Write-Host "  0) Quitter"
     Write-Host ""
@@ -1404,6 +1955,7 @@ try {
     $needRelaunch = $false
     try { $needRelaunch = Invoke-GithubUpdate } catch {
         Write-Warn ("Maj GitHub ignoree : " + $_.Exception.Message)
+        Write-DebugLog "GithubUpdate warn: $($_.Exception.Message)"
     }
     if ($needRelaunch) {
         $env:SYNC_COLLAB_UPDATED = "1"
@@ -1411,11 +1963,15 @@ try {
         exit 0
     }
 
+    try { Invoke-SelfDebug } catch { Write-DebugLog "SelfDebug err: $($_.Exception.Message)" }
+
     $c = Show-Menu
     if ($c -eq "1") {
         Invoke-Receive
     } elseif ($c -eq "2") {
         Invoke-Send
+    } elseif ($c -eq "3") {
+        Invoke-DirectMenu
     } elseif ($c -eq "0") {
         exit 0
     } else {
@@ -1423,7 +1979,9 @@ try {
     }
 } catch {
     Write-ErrMsg $_.Exception.Message
+    Write-DebugLog ("FATAL: " + $_.Exception.Message + " | " + $_.ScriptStackTrace)
     Write-Host $_.ScriptStackTrace -ForegroundColor DarkGray
+    Write-Host ("Debug: " + (Join-Path $Root "debug.log")) -ForegroundColor Yellow
 }
 
 Write-Host ""

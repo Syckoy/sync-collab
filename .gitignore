@@ -1,0 +1,14 @@
+tools/
+st-home/
+logs/
+ami.json
+.update-state.json
+.dernier-arbre.txt
+receive-log.txt
+backups/
+*.sync-conflict-*
+*.log
+*.exe
+*.zip
+index-v2/
+sync-collab-GITHUB/

@@ -4,17 +4,29 @@
 Snicula travaille sur le serveur. Quand il a fini : ENVOYER.
 Toi tu RECUPERES son travail. Simple.
 
-## Regles de confiance (v2.3)
-1. RECUPERER = fusion uniquement (ajoute / remplace). **Jamais de suppression** de tes dossiers.
-2. Avant chaque recuperation : **backup automatique** dans `sync/backups/pre-recv-...`
-3. ENVOYER : le zip est controle, le lien est re-telecharge pour verif, **puis seulement** le manifeste est publie.
-4. Gros packs : decoupe en morceaux + barre de progression.
+## Modes
+| Choix | Quand | Vitesse |
+|-------|-------|---------|
+| **1 RECUPERER** | L autre a deja envoye (messager) | Moyen (upload/download) |
+| **2 ENVOYER** | L autre n est pas la / pour plus tard | Moyen |
+| **3 DIRECT** | Les DEUX sont devant le PC | Rapide (TCP local / IP) |
 
-## Usage
-1. Les DEUX ont la meme version (`sync.ps1` + `version.json`)
-2. Lui : `sync.bat` -> 2 (envoyer)
-3. Toi : `sync.bat` -> 1 (recuperer)
+## Regles de confiance (v2.4)
+1. RECUPERER / DIRECT = fusion uniquement (ajoute / remplace). **Jamais de suppression** de tes dossiers.
+2. Avant chaque fusion : **backup automatique** dans `sync/backups/pre-recv-...`
+3. ENVOYER (messager) : zip controle, lien re-telecharge, **puis seulement** manifeste publie.
+4. DIRECT : meme pack + hash SHA256, multi-ports (27890..), discovery LAN, log dans `debug.log`.
+5. Au demarrage : auto-debug (curl, gmod, ports, IPs) ecrit dans `debug.log`.
+
+## Usage DIRECT (rapide)
+1. Les DEUX ont la meme version (`sync.bat` a jour)
+2. Celui qui envoie : `3` -> `H` (heberger) -> donne l IP affichee
+3. Celui qui recoit : `3` -> `C` (connecter) -> choisit le PC trouve ou tape l IP
+4. Transfert + fusion + backup auto
+
+Si pas sur le meme WiFi : entre l IP publique + ouvre le port TCP cote hebergeur (ou VPN / ZeroTier).
 
 ## Si ca merde
 - Rien n a du etre publie si l upload echoue (pas de faux lien)
 - Si la fusion te plait pas : restaure depuis `sync/backups/`
+- Envoie / lis `sync/debug.log` pour voir ce qui a echoue
