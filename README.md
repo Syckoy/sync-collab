@@ -19,12 +19,12 @@ Toi tu RECUPERES son travail. Simple.
 5. Au demarrage : auto-debug (curl, gmod, ports, IPs) ecrit dans `debug.log`.
 
 ## Usage DIRECT (rapide)
-1. Les DEUX ont la meme version (`sync.bat` a jour)
-2. Celui qui envoie : `3` -> `H` (heberger) -> donne l IP affichee
-3. Celui qui recoit : `3` -> `C` (connecter) -> choisit le PC trouve ou tape l IP
-4. Transfert + fusion + backup auto
+1. Les DEUX ont la meme version (`sync.bat` a jour — accepter la maj GitHub)
+2. Celui qui envoie : `3` -> `H` (heberger) — session annoncee auto + IP affichee
+3. Celui qui recoit : `3` -> `C` (connecter) — Entree pour essayer toutes les sessions trouvees
+4. Transfert TCP + hash + fusion + backup auto
 
-Si pas sur le meme WiFi : entre l IP publique + ouvre le port TCP cote hebergeur (ou VPN / ZeroTier).
+Si pas sur le meme WiFi : VPN (ZeroTier/Hamachi) ou port TCP ouvert. Sinon utilise 1/2 messager.
 
 ## Si ca merde
 - Rien n a du etre publie si l upload echoue (pas de faux lien)
