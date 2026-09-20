@@ -1536,42 +1536,169 @@ function Invoke-SelfDebug {
     }
 }
 
-function Get-LanIPv4List {
-    $ips = @()
+function Get-NetworkEndpoints {
+    $list = New-Object System.Collections.Generic.List[object]
     try {
-        $ips = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+        $rows = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
             Where-Object {
                 $_.IPAddress -notlike "127.*" -and
-                $_.IPAddress -notlike "169.254.*" -and
-                $_.PrefixOrigin -ne "WellKnown"
-            } | Select-Object -ExpandProperty IPAddress -Unique)
+                $_.IPAddress -notlike "169.254.*"
+            })
+        foreach ($r in $rows) {
+            $alias = [string]$r.InterfaceAlias
+            $ip = [string]$r.IPAddress
+            $kind = "lan"
+            if ($alias -match '(?i)radmin|hamachi|zerotier|tailscale|wireguard|vpn|tun|tap|openvpn|softether') {
+                $kind = "vpn"
+            } elseif ($ip -match '^26\.') {
+                # Radmin VPN classique = 26.x.x.x
+                $kind = "vpn"
+            } elseif ($ip -match '^100\.') {
+                $kind = "vpn" # CGNAT / Tailscale-ish
+            }
+            $list.Add([pscustomobject]@{
+                Ip    = $ip
+                Alias = $alias
+                Kind  = $kind
+            }) | Out-Null
+        }
     } catch { }
-    if ($ips.Count -eq 0) {
+    if ($list.Count -eq 0) {
         try {
-            $ips = @([System.Net.Dns]::GetHostAddresses([System.Net.Dns]::GetHostName()) |
+            $fallback = @([System.Net.Dns]::GetHostAddresses([System.Net.Dns]::GetHostName()) |
                 Where-Object { $_.AddressFamily -eq "InterNetwork" } |
                 ForEach-Object { $_.ToString() } |
                 Where-Object { $_ -notlike "127.*" -and $_ -notlike "169.254.*" })
+            foreach ($ip in $fallback) {
+                $kind = if ($ip -match '^26\.') { "vpn" } else { "lan" }
+                $list.Add([pscustomobject]@{ Ip = $ip; Alias = "?"; Kind = $kind }) | Out-Null
+            }
         } catch { }
     }
-    return @($ips)
+    # VPN d abord
+    return @($list | Sort-Object @{ Expression = { if ($_.Kind -eq "vpn") { 0 } else { 1 } } }, Ip)
+}
+
+function Get-LanIPv4List {
+    return @((Get-NetworkEndpoints).Ip | Select-Object -Unique)
+}
+
+function Get-VpnIPv4List {
+    return @((Get-NetworkEndpoints | Where-Object { $_.Kind -eq "vpn" }).Ip | Select-Object -Unique)
+}
+
+function Ensure-DirectFirewall {
+    $name = "SyncCollab-Direct-All"
+    $portArg = "27890-27892,27901-27902"
+    $ok = $false
+    try {
+        $existing = netsh advfirewall firewall show rule name="$name" 2>$null
+        if ($existing -match $name) {
+            Write-DebugLog "firewall rule already exists: $name"
+            return $true
+        }
+    } catch { }
+
+    $addArgs = @(
+        "advfirewall", "firewall", "add", "rule",
+        "name=$name", "dir=in", "action=allow", "protocol=TCP",
+        "localport=$portArg", "profile=any", "enable=yes",
+        "edge=yes"
+    )
+    try {
+        $r = Start-Process -FilePath "netsh" -ArgumentList $addArgs -Wait -PassThru -WindowStyle Hidden
+        Write-DebugLog ("firewall add exit=$($r.ExitCode)")
+        if ($r.ExitCode -eq 0) { return $true }
+    } catch {
+        Write-DebugLog ("firewall add fail: $($_.Exception.Message)")
+    }
+
+    Write-Warn "Pare-feu : besoin d admin (Radmin est souvent en reseau Public = bloque)."
+    Write-Host "Une fenetre UAC va s ouvrir : accepte pour ouvrir les ports Sync." -ForegroundColor Yellow
+    try {
+        $r2 = Start-Process -FilePath "netsh" -ArgumentList $addArgs -Verb RunAs -Wait -PassThru
+        Write-DebugLog ("firewall UAC exit=$($r2.ExitCode)")
+        $ok = ($r2.ExitCode -eq 0)
+    } catch {
+        Write-DebugLog ("firewall UAC fail: $($_.Exception.Message)")
+        $ok = $false
+    }
+    if (-not $ok) {
+        Write-Warn "Pare-feu NON ouvert. Chez l hebergeur : autorise TCP 27890-27892 et 27901-27902 (profil Public inclus)."
+    } else {
+        Write-Ok "Pare-feu OK (tous profils, y compris Public/Radmin)."
+    }
+    return $ok
 }
 
 function Try-AddFirewallRule([int]$port) {
-    try {
-        $name = "SyncCollab-Direct-$port"
-        $existing = netsh advfirewall firewall show rule name="$name" 2>$null
-        if ($existing -match $name) { return $true }
-        $r = Start-Process -FilePath "netsh" -ArgumentList @(
-            "advfirewall", "firewall", "add", "rule",
-            "name=$name", "dir=in", "action=allow", "protocol=TCP", "localport=$port"
-        ) -Wait -PassThru -WindowStyle Hidden
-        Write-DebugLog ("firewall port $port exit=$($r.ExitCode)")
-        return ($r.ExitCode -eq 0)
-    } catch {
-        Write-DebugLog ("firewall fail: $($_.Exception.Message)")
-        return $false
+    return (Ensure-DirectFirewall)
+}
+
+function Test-IsLikelyWrongVpnIp([string]$ip) {
+    $mineVpn = @(Get-VpnIPv4List)
+    if ($mineVpn.Count -eq 0) { return $false }
+    # Si ON a Radmin (26.x) et qu on tape du 192.168 -> presque surement faux
+    if (($mineVpn | Where-Object { $_ -match '^26\.' }) -and ($ip -match '^192\.168\.')) {
+        return $true
     }
+    return $false
+}
+
+function Invoke-DirectDiagnose([string[]]$ips, [int[]]$ports) {
+    Write-Host ""
+    Write-Host "=== DIAGNOSTIC DIRECT ===" -ForegroundColor Yellow
+    $eps = Get-NetworkEndpoints
+    Write-Host "Tes interfaces :"
+    foreach ($e in $eps) {
+        $col = if ($e.Kind -eq "vpn") { "Green" } else { "Gray" }
+        Write-Host ("  [{0}] {1}  ({2})" -f $e.Kind.ToUpper(), $e.Ip, $e.Alias) -ForegroundColor $col
+        Write-DebugLog ("iface kind=$($e.Kind) ip=$($e.Ip) alias=$($e.Alias)")
+    }
+
+    foreach ($ip in $ips) {
+        if (Test-IsLikelyWrongVpnIp $ip) {
+            Write-Host ""
+            Write-Warn "IP $ip = Wi-Fi/LAN chez LUI, PAS joignable via Radmin."
+            Write-Host "Dans Radmin VPN, prends son IP 26.x.x.x (affichee dans Radmin), pas 192.168.x.x" -ForegroundColor Yellow
+            Write-DebugLog "DIAG wrong-ip-type target=$ip (have local radmin)"
+        }
+
+        Write-Host ""
+        Write-Info ("Ping $ip ...")
+        $pingOk = $false
+        try {
+            $pingOk = Test-Connection -ComputerName $ip -Count 2 -Quiet -ErrorAction SilentlyContinue
+        } catch { }
+        if ($pingOk) {
+            Write-Ok "Ping OK (le VPN voit la machine)"
+            Write-DebugLog "DIAG ping OK $ip"
+        } else {
+            Write-Warn "Ping KO - Radmin pas connecte a lui, mauvaise IP, ou ping bloque."
+            Write-DebugLog "DIAG ping FAIL $ip"
+        }
+
+        $probePort = $ports[0]
+        Write-Info ("Test TCP ${ip}:$probePort ...")
+        $tcpOk = $false
+        try {
+            $tnc = Test-NetConnection -ComputerName $ip -Port $probePort -WarningAction SilentlyContinue -ErrorAction SilentlyContinue
+            $tcpOk = [bool]$tnc.TcpTestSucceeded
+            Write-DebugLog ("DIAG tnc $ip`:$probePort tcp=$tcpOk ping=$($tnc.PingSucceeded)")
+        } catch {
+            Write-DebugLog "DIAG tnc err: $($_.Exception.Message)"
+        }
+        if ($tcpOk) {
+            Write-Ok "Port ouvert ! Relance Connect juste apres."
+        } else {
+            Write-Warn "Port ferme / filtre. Causes frequentes :"
+            Write-Host "  1) Chez LUI : sync option 3 -> H (Heberger) doit rester ouvert" -ForegroundColor Yellow
+            Write-Host "  2) Chez LUI : accepter UAC pare-feu (profil Public / Radmin)" -ForegroundColor Yellow
+            Write-Host "  3) Mauvaise IP : utiliser l IP Radmin 26.x, pas le Wi-Fi 192.168" -ForegroundColor Yellow
+            Write-Host "  4) Les DEUX doivent etre en ligne dans le meme reseau Radmin" -ForegroundColor Yellow
+        }
+    }
+    Write-Host ("Details: " + (Join-Path $Root "debug.log")) -ForegroundColor DarkGray
 }
 
 function Apply-PackZipFile([string]$zipPath) {
@@ -1696,14 +1823,17 @@ function Start-DirectHost {
         sentAt    = (Get-Date).ToString("o")
     }
 
+    Write-Info "Ouverture pare-feu (obligatoire pour Radmin = reseau Public)..."
+    [void](Ensure-DirectFirewall)
+
     $listener = $null
     $boundPort = 0
     foreach ($p in $script:DirectPorts) {
         try {
             $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Any, $p)
+            $listener.Server.SetSocketOption([System.Net.Sockets.SocketOptionLevel]::Socket, [System.Net.Sockets.SocketOptionName]::ReuseAddress, $true)
             $listener.Start()
             $boundPort = $p
-            [void](Try-AddFirewallRule $p)
             Write-DebugLog "LISTEN OK port=$p"
             break
         } catch {
@@ -1716,20 +1846,60 @@ function Start-DirectHost {
         throw "Aucun port libre parmi: $($script:DirectPorts -join ', '). Ferme un logiciel ou autorise le pare-feu."
     }
 
-    $ips = Get-LanIPv4List
-    Write-Ok ("En ecoute sur le port $boundPort")
-    Write-Host "Dis a l autre de choisir option 3 -> Se connecter"
-    Write-Host "IP(s) a entrer chez lui :" -ForegroundColor Yellow
-    foreach ($ip in $ips) { Write-Host ("   $ip") -ForegroundColor Yellow }
-    if ($ips.Count -eq 0) { Write-Warn "IP locale introuvable - donne ton IP Windows (ipconfig)." }
+    $eps = Get-NetworkEndpoints
+    $ips = @($eps.Ip | Select-Object -Unique)
+    $vpnIps = @($eps | Where-Object { $_.Kind -eq "vpn" } | ForEach-Object { $_.Ip })
+    Write-Ok ("En ecoute sur le port $boundPort (toutes interfaces)")
+    Write-Host ""
+    Write-Host "Dis a l autre : sync option 3 -> C (Connecter)" -ForegroundColor Cyan
+    if ($vpnIps.Count -gt 0) {
+        Write-Host ""
+        Write-Host ">>> IP RADMIN / VPN A LUI DONNER (copie ca) <<<" -ForegroundColor Green
+        foreach ($ip in $vpnIps) {
+            Write-Host ("      $ip") -ForegroundColor Green
+        }
+        Write-Host "PAS son Wi-Fi 192.168 - UNIQUEMENT l IP ci-dessus (souvent 26.x)" -ForegroundColor Yellow
+    }
+    Write-Host ""
+    Write-Host "Toutes tes IPs (secours) :" -ForegroundColor DarkGray
+    foreach ($e in $eps) {
+        Write-Host ("   [{0}] {1}  {2}" -f $e.Kind, $e.Ip, $e.Alias) -ForegroundColor DarkGray
+    }
+    if ($ips.Count -eq 0) { Write-Warn "IP locale introuvable." }
+
+    # Auto-test : le port repond en local (on consomme tout de suite la fausse connexion)
+    try {
+        $self = New-Object System.Net.Sockets.TcpClient
+        $iar = $self.BeginConnect("127.0.0.1", $boundPort, $null, $null)
+        if ($iar.AsyncWaitHandle.WaitOne(1000, $false)) {
+            $self.EndConnect($iar)
+            $self.Close()
+            Start-Sleep -Milliseconds 150
+            if ($listener.Pending()) {
+                $bogus = $listener.AcceptTcpClient()
+                $bogus.Close()
+            }
+            Write-Ok "Auto-test local port $boundPort : OK"
+            Write-DebugLog "HOST selftest loopback OK"
+        } else {
+            Write-Warn "Auto-test local timeout (bizarre)."
+            Write-DebugLog "HOST selftest loopback timeout"
+            try { $self.Close() } catch { }
+        }
+    } catch {
+        Write-DebugLog "HOST selftest fail: $($_.Exception.Message)"
+        try { if ($listener.Pending()) { $listener.AcceptTcpClient().Close() } } catch { }
+    }
+
     Write-Info "Signalement session (ntfy) pour que l autre te trouve auto..."
     if (Publish-DirectPresence $cfg $ips $boundPort ([int64]$pack.Length)) {
         Write-Ok "Session annoncee. L autre peut juste faire 3 -> C."
     } else {
-        Write-Warn "Signalement ntfy rate - il devra taper ton IP manuellement."
+        Write-Warn "Signalement ntfy rate - il devra taper ton IP Radmin manuellement."
     }
-    Write-Host "Attente de connexion (Ctrl+C pour annuler)..."
-    Write-DebugLog ("HOST waiting ips=$($ips -join ',') port=$boundPort size=$($pack.Length)")
+    Write-Host ""
+    Write-Host "Laisse cette fenetre OUVERTE. Attente de connexion..." -ForegroundColor Magenta
+    Write-DebugLog ("HOST waiting ips=$($ips -join ',') vpn=$($vpnIps -join ',') port=$boundPort size=$($pack.Length)")
 
     # Discovery UDP en parallele (job leger)
     $discover = $null
@@ -1863,10 +2033,22 @@ function Start-DirectClient {
         }
     }
     if (-not $ip -and $tryIps.Count -eq 0) {
-        $ip = Read-Host "IP de l autre (ex 192.168.1.42)"
+        Write-Host "Sous Radmin : tape son IP 26.x (dans Radmin), PAS 192.168.x" -ForegroundColor Yellow
+        $ip = Read-Host "IP de l autre (ex 26.182.232.196)"
     }
     if ($ip) { $tryIps.Clear(); $tryIps.Add($ip) | Out-Null }
     if ($tryIps.Count -eq 0) { throw "IP manquante." }
+
+    foreach ($cand in @($tryIps)) {
+        if (Test-IsLikelyWrongVpnIp $cand) {
+            Write-Warn "ATTENTION: $cand ressemble a du Wi-Fi local. Via Radmin il faut l IP 26.x de ton ami."
+            $fix = Read-Host "Continuer quand meme avec $cand ? (O/N)"
+            if ($fix -notmatch '^[oOyY]') {
+                $alt = Read-Host "Colle son IP Radmin 26.x"
+                if ($alt) { $tryIps.Clear(); $tryIps.Add($alt.Trim()) | Out-Null }
+            }
+        }
+    }
 
     $ports = @()
     if ($portHint) { $ports += $portHint }
@@ -1882,8 +2064,12 @@ function Start-DirectClient {
                 Write-Info ("Connexion $($candIp):$p ...")
                 $client = New-Object System.Net.Sockets.TcpClient
                 $iar = $client.BeginConnect($candIp, $p, $null, $null)
-                $ok = $iar.AsyncWaitHandle.WaitOne(3000, $false)
-                if (-not $ok) { $client.Close(); $client = $null; continue }
+                # VPN = latence plus haute
+                $ok = $iar.AsyncWaitHandle.WaitOne(8000, $false)
+                if (-not $ok) {
+                    Write-DebugLog "CLIENT timeout $candIp`:$p"
+                    $client.Close(); $client = $null; continue
+                }
                 $client.EndConnect($iar)
                 $usedPort = $p
                 $usedIp = $candIp
@@ -1898,7 +2084,8 @@ function Start-DirectClient {
         }
     }
     if (-not $client) {
-        throw "Impossible de joindre ($($tryIps -join ', ')) ports $($ports -join ', '). Verifiez: meme WiFi / VPN, Heberger lance chez lui, pare-feu Windows."
+        Invoke-DirectDiagnose (@($tryIps)) (@($ports))
+        throw "Impossible de joindre ($($tryIps -join ', ')). Chez LUI: 3->H ouvert + UAC pare-feu. Chez TOI: IP Radmin 26.x."
     }
 
     $zip = Join-Path $env:TEMP ("serveur-direct-recv-" + [guid]::NewGuid().ToString("N") + ".zip")
