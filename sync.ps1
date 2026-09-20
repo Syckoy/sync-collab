@@ -864,6 +864,108 @@ function Test-ZipFile([string]$path) {
     } finally { $fs.Close() }
 }
 
+function Assert-PackZipReady([string]$zipPath) {
+    if (-not (Test-ZipFile $zipPath)) {
+        throw "Pack local invalide (pas un zip). Envoi annule."
+    }
+    $zip = $null
+    try {
+        $zip = New-Utf8Zip $zipPath "Read"
+        $names = @($zip.Entries | ForEach-Object { $_.FullName })
+        if ($names.Count -lt 2) { throw "Pack quasi vide. Envoi annule." }
+        if ($names -notcontains "index.json") { throw "Pack sans index.json. Envoi annule." }
+        $idxEntry = $zip.GetEntry("index.json")
+        $sr = New-Object System.IO.StreamReader($idxEntry.Open())
+        try { $raw = $sr.ReadToEnd() } finally { $sr.Close() }
+        $idx = $raw | ConvertFrom-Json
+        if (-not $idx.files -or @($idx.files).Count -lt 1) {
+            throw "index.json sans fichiers. Envoi annule."
+        }
+        Write-Ok ("Controle pack OK : {0} fichiers indexes, {1} entrees zip." -f @($idx.files).Count, $names.Count)
+        return $idx
+    } finally {
+        if ($zip) { $zip.Dispose() }
+    }
+}
+
+function Test-UrlFetchable([string]$url) {
+    if (-not (Test-DirectPackUrl $url)) { return $false }
+    $curl = Get-Curl
+    $tmp = Join-Path $env:TEMP ("sync-probe-" + [guid]::NewGuid().ToString("N") + ".bin")
+    try {
+        & $curl -sS -L --fail --connect-timeout 20 --max-time 120 -A "sync-collab" -r 0-2047 -o $tmp -- $url 2>$null
+        if ($LASTEXITCODE -ne 0) {
+            # certains hosts refusent Range : retente sans
+            & $curl -sS -L --fail --connect-timeout 20 --max-time 120 -A "sync-collab" -o $tmp -- $url 2>$null
+        }
+        if ($LASTEXITCODE -ne 0) { return $false }
+        return ((Test-Path -LiteralPath $tmp) -and ((Get-Item -LiteralPath $tmp).Length -gt 0))
+    } catch {
+        return $false
+    } finally {
+        try { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue } catch { }
+    }
+}
+
+function Backup-LocalBeforeReceive($cfg, $gmod) {
+    $backupRoot = Join-Path $Root "backups"
+    if (-not (Test-Path -LiteralPath $backupRoot)) {
+        New-Item -ItemType Directory -Path $backupRoot -Force | Out-Null
+    }
+    $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
+    $dest = Join-Path $backupRoot ("pre-recv-" + $stamp)
+    New-Item -ItemType Directory -Path $dest -Force | Out-Null
+    Write-Info "SECURITE : sauvegarde locale avant fusion..."
+    Write-Info ("Dossier : " + $dest)
+
+    $folders = @("addons", "cfg", "gamemodes", "data", "settings", "_paused_addons")
+    $robo = Join-Path $env:SystemRoot "System32\robocopy.exe"
+    foreach ($name in $folders) {
+        $src = Join-Path $gmod.FullName $name
+        if (-not (Test-Path -LiteralPath $src)) { continue }
+        Write-Host ("  Backup " + $name + "...") -ForegroundColor DarkGray
+        $target = Join-Path $dest $name
+        if (Test-Path -LiteralPath $robo) {
+            & $robo $src $target /E /R:1 /W:1 /NFL /NDL /NJH /NJS /nc /ns /np | Out-Null
+            # robocopy codes 0-7 = success-ish
+            if ($LASTEXITCODE -ge 8) {
+                Write-Warn ("Backup partiel : " + $name)
+            }
+        } else {
+            Copy-Item -LiteralPath $src -Destination $target -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    $ds = Get-GmodParent $gmod
+    foreach ($extra in @("start.bat", "steam_appid.txt")) {
+        $p = Join-Path $ds $extra
+        if (Test-Path -LiteralPath $p) {
+            Copy-Item -LiteralPath $p -Destination (Join-Path $dest $extra) -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    # Garde les 5 derniere backups max
+    $olds = @(Get-ChildItem -LiteralPath $backupRoot -Directory -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -like "pre-recv-*" } |
+        Sort-Object Name -Descending)
+    if ($olds.Count -gt 5) {
+        $olds | Select-Object -Skip 5 | ForEach-Object {
+            try { Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue } catch { }
+        }
+    }
+
+    Write-Ok ("Backup OK (si probleme, restaure depuis : " + $dest + ")")
+    return $dest
+}
+
+function Write-ReceiveLog([string]$msg) {
+    try {
+        $log = Join-Path $Root "receive-log.txt"
+        $line = ("{0}  {1}" -f (Get-Date).ToString("o"), $msg)
+        Add-Content -LiteralPath $log -Value $line -Encoding UTF8
+    } catch { }
+}
+
 function Get-Manifest($cfg) {
     $channel = [string]$cfg.dropChannel
     if (-not $channel) { $channel = "syckoy-gmod-sync-collab" }
@@ -905,23 +1007,68 @@ function Get-Manifest($cfg) {
 function Invoke-Send {
     $cfg = Get-Cfg
     Write-Host ""
-    Write-Host "=== ENVOI DU SERVEUR ===" -ForegroundColor Magenta
-    Write-Host "Etape A : compression (avec barre de progression)"
-    Write-Host "Etape B : upload (morceaux si gros pack)"
+    Write-Host "=== ENVOI DU SERVEUR (mode confiance) ===" -ForegroundColor Magenta
+    Write-Host "A) Compression + controles"
+    Write-Host "B) Upload + verification du lien"
+    Write-Host "C) Publication du manifeste (seulement si B OK)"
     Write-Host ""
     $pack = New-ServerPack $cfg
     try {
+        Write-Info "Controle du zip avant envoi..."
+        $idx = Assert-PackZipReady $pack.FullName
+        $fileCount = @($idx.files).Count
+
         Write-Host ""
         Write-Info "Etape B : envoi en ligne..."
         $up = Send-PackFile $pack.FullName
+
+        Write-Info "Verification que le lien est telechargeable..."
+        $checkUrl = $up.url
+        if ($up.indexUrl) { $checkUrl = $up.indexUrl }
+        if (-not (Test-UrlFetchable $checkUrl)) {
+            throw "Upload refuse : le lien ne se telecharge pas. RIEN n a ete publie. Reessaie."
+        }
+        Write-Ok "Lien verifie (telechargeable)."
+
+        if ($up.format -eq "sync-collab-parts-v1") {
+            Write-Info "Controle index multi-parts..."
+            $probe = Join-Path $env:TEMP ("sync-idx-check-" + [guid]::NewGuid().ToString("N") + ".json")
+            try {
+                Get-RemoteFile $checkUrl $probe
+                $remoteIdx = Get-Content -LiteralPath $probe -Raw -Encoding UTF8 | ConvertFrom-Json
+                $pc = @($remoteIdx.parts).Count
+                if ($pc -lt 1) { throw "Index distant vide." }
+                if ($up.partCount -and ([int]$up.partCount -ne $pc)) {
+                    throw ("Nombre de parts incoherent (local {0} / distant {1})." -f $up.partCount, $pc)
+                }
+                $p0 = [string](@($remoteIdx.parts | Sort-Object { [int]$_.i })[0].url)
+                if (-not (Test-UrlFetchable $p0)) {
+                    throw "La partie 0 ne se telecharge pas. Publication annulee."
+                }
+                Write-Ok ("Index distant OK ({0} morceaux)." -f $pc)
+            } finally {
+                try { Remove-Item -LiteralPath $probe -Force -ErrorAction SilentlyContinue } catch { }
+            }
+        }
+
+        if ($up.sha256) {
+            $localSha = Get-FileSha256 $pack.FullName
+            if ($up.sha256 -ne $localSha -and $up.format -eq "single") {
+                throw "Hash local/remote incoherent. Envoi annule."
+            }
+        }
+
+        Write-Info "Publication du manifeste..."
         Publish-Manifest $cfg $up $pack.Length
         Write-Host ""
-        Write-Ok "C est envoye. Tu peux FERMER le logiciel."
-        Write-Host "L autre pourra recuperer plus tard, meme si tu n es plus la."
+        Write-Ok "ENVOI TERMINE ET VERIFIE."
+        Write-Host ("Fichiers dans le pack : " + $fileCount)
+        Write-Host "L autre peut recuperer (bouton 1) - fusion, sans suppression chez lui."
         if ($up.code) {
             Write-Host ("Code multi-parts : " + $up.code + " (" + $up.partCount + " morceaux)")
         }
         Write-Host ("Lien (secours) : " + $up.page)
+        Write-ReceiveLog ("SEND ok files=" + $fileCount + " size=" + $pack.Length + " url=" + $up.page)
     } finally {
         try { Remove-Item -LiteralPath $pack.FullName -Force -ErrorAction SilentlyContinue } catch { }
     }
@@ -1174,6 +1321,13 @@ function Receive-PackToZip($man, [string]$zipOut) {
 
 function Invoke-Receive {
     $cfg = Get-Cfg
+    Write-Host ""
+    Write-Host "=== RECUPERATION (mode confiance) ===" -ForegroundColor Magenta
+    Write-Host "1) Telecharger + verifier"
+    Write-Host "2) Backup local automatique"
+    Write-Host "3) Fusion (AJOUT/REMPLACE uniquement - ZERO suppression)"
+    Write-Host ""
+
     Write-Info "Recherche de la derniere version envoyee..."
     $man = Get-Manifest $cfg
     Write-Ok ("Trouve : " + $man.sentAt)
@@ -1185,7 +1339,14 @@ function Invoke-Receive {
     Receive-PackToZip $man $zip
 
     if (-not (Test-ZipFile $zip)) {
-        throw "Le fichier telecharge n est pas un zip. Demande a ton ami de renvoyer avec la nouvelle version (bouton 2)."
+        throw "Fichier telecharge invalide. RIEN n a ete modifie chez toi."
+    }
+    if ($man.sha256 -and $man.format -eq "single") {
+        $got = Get-FileSha256 $zip
+        if ($got -ne [string]$man.sha256) {
+            throw "Hash du telechargement incorrect. RIEN n a ete modifie chez toi."
+        }
+        Write-Ok "Hash telechargement OK."
     }
 
     $extract = Join-Path $env:TEMP ("serveur-recv-" + [guid]::NewGuid().ToString("N"))
@@ -1193,22 +1354,31 @@ function Invoke-Receive {
     Write-Info "Extraction..."
     Expand-Utf8Zip $zip $extract
 
-    $gmod = Find-GmodDir $cfg
     $index = Read-PackIndex $extract
-    if ($index -and $index.format -eq "sync-collab-v2") {
-        Write-Info "Comparaison ancienne version / pack recu..."
-        Invoke-MirrorPack $cfg $gmod $index $extract
-        $treeOut = Join-Path $Root ".dernier-arbre.txt"
-        try { Save-TreeDoc $index $treeOut } catch { }
-        Write-Info ("Arbre de l autre enregistre : " + $treeOut)
-    } else {
-        Invoke-LegacyReceive $gmod $extract
+    if (-not $index -or $index.format -ne "sync-collab-v2") {
+        throw "Pack sans index v2. RIEN n a ete modifie. Demande a l autre de renvoyer avec sync a jour."
     }
+    $nFiles = @($index.files).Count
+    if ($nFiles -lt 1) {
+        throw "Pack vide. RIEN n a ete modifie chez toi."
+    }
+    Write-Ok ("Pack valide : " + $nFiles + " fichiers a fusionner.")
 
+    $gmod = Find-GmodDir $cfg
+    $backupPath = Backup-LocalBeforeReceive $cfg $gmod
+
+    Write-Info "Fusion en cours (aucune suppression)..."
+    Invoke-MirrorPack $cfg $gmod $index $extract
+    $treeOut = Join-Path $Root ".dernier-arbre.txt"
+    try { Save-TreeDoc $index $treeOut } catch { }
+
+    Write-ReceiveLog ("RECV ok files=" + $nFiles + " backup=" + $backupPath)
     try { Remove-Item -LiteralPath $zip -Force -ErrorAction SilentlyContinue } catch { }
     try { Remove-Item -LiteralPath $extract -Recurse -Force -ErrorAction SilentlyContinue } catch { }
     Write-Host ""
-    Write-Ok "Serveur recupere. Tu peux fermer."
+    Write-Ok "RECUPERATION TERMINEE (fusion)."
+    Write-Host ("Backup de securite : " + $backupPath)
+    Write-Host "Tes autres dossiers non presents dans le pack sont INTACTS."
 }
 
 function Show-Menu {
@@ -1217,12 +1387,11 @@ function Show-Menu {
     Write-Host "  SYNC COLLAB" -ForegroundColor Magenta
     Write-Host "=============================================="
     Write-Host ""
-    Write-Host "  1) RECUPERER le serveur"
-    Write-Host "     Fusion : ajoute/remplace le travail de l autre"
-    Write-Host "     (ne supprime RIEN chez toi)"
+    Write-Host "  1) RECUPERER"
+    Write-Host "     Fusion + backup auto (ne supprime rien)"
     Write-Host ""
-    Write-Host "  2) ENVOYER une nouvelle version"
-    Write-Host "     Upload le pack, puis tu PEUX FERMER"
+    Write-Host "  2) ENVOYER"
+    Write-Host "     Pack verifie + lien reteste avant publication"
     Write-Host ""
     Write-Host "  0) Quitter"
     Write-Host ""
