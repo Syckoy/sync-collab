@@ -420,48 +420,113 @@ function New-ServerPack($cfg) {
 function Get-ShortErr([string]$s) {
     if (-not $s) { return "(vide)" }
     if ($s -match "uploads disabled") { return "hebergeur ferme (spam)" }
+    if ($s -match "(?i)file (is )?too large|payload too large|413") { return "fichier trop gros pour cet hebergeur" }
     if ($s -match "(?i)internal server error|<html|<!doctype") { return "hebergeur down (erreur 500)" }
     $t = $s.Trim()
     if ($t.Length -gt 180) { return $t.Substring(0, 180) }
     return $t
 }
 
+function Test-UploadUrl([string]$raw) {
+    if (-not $raw) { return $null }
+    $m = [regex]::Match($raw.Trim(), "https?://[^\s`"']+")
+    if (-not $m.Success) { return $null }
+    return $m.Value.Trim().TrimEnd(".", ",", ")", "]")
+}
+
+function Invoke-HostUpload([string]$name, [scriptblock]$attempt) {
+    for ($try = 1; $try -le 2; $try++) {
+        if ($try -gt 1) {
+            Write-Info ("Nouvelle tentative " + $name + " dans 3s...")
+            Start-Sleep -Seconds 3
+        } else {
+            Write-Info ("Tentative " + $name + "...")
+        }
+        try {
+            $raw = & $attempt
+            $u = Test-UploadUrl ([string]$raw)
+            if ($u) {
+                Write-Ok ("Pack envoye via " + $name + ".")
+                return [pscustomobject]@{ id = $u; url = $u; page = $u; host = $name }
+            }
+            # file.io JSON
+            try {
+                $json = ([string]$raw) | ConvertFrom-Json
+                if ($json.success -and $json.link) {
+                    $u2 = [string]$json.link
+                    Write-Ok ("Pack envoye via " + $name + ".")
+                    return [pscustomobject]@{ id = $u2; url = $u2; page = $u2; host = $name }
+                }
+            } catch { }
+            Write-Warn ($name + " : " + (Get-ShortErr ([string]$raw)))
+        } catch {
+            Write-Warn ($name + " : " + (Get-ShortErr ([string]$_.Exception.Message)))
+        }
+    }
+    return $null
+}
+
 function Send-PackFile([string]$zipPath) {
     $curl = Get-Curl
     Write-Info "Envoi du pack (tu pourras fermer ensuite)..."
-    $fileForm = "file=@$zipPath"
-
-    Write-Info "Tentative catbox..."
-    $raw = & $curl -sS -A "sync-collab" -F "reqtype=fileupload" -F "fileToUpload=@$zipPath" "https://catbox.moe/user/api.php"
-    if ($raw -and $raw -match "^https?://\S+$") {
-        $u = $raw.Trim()
-        Write-Ok "Pack envoye."
-        return [pscustomobject]@{ id = $u; url = $u; page = $u }
+    $sizeMb = [math]::Round((Get-Item -LiteralPath $zipPath).Length / 1MB, 1)
+    Write-Info ("Taille pack : " + $sizeMb + " Mo")
+    if ($sizeMb -gt 190) {
+        Write-Warn "Pack > 190 Mo : catbox risque d echouer — litterbox / 0x0 prioritaires."
     }
-    Write-Warn ("catbox : " + (Get-ShortErr $raw))
 
-    Write-Info "Tentative bashupload..."
-    $raw = & $curl -sS -A "sync-collab" -T $zipPath "https://bashupload.com/serveur-pack.zip"
-    if ($raw -and $raw -match "https?://\S+") {
-        $u = ([regex]::Match($raw, "https?://\S+")).Value.Trim().TrimEnd(".")
-        Write-Ok "Pack envoye."
-        return [pscustomobject]@{ id = $u; url = $u; page = $u }
+    # Litterbox : jusqu a 1 Go, lien direct, expire 72h — ideal pour gros packs serveur
+    $up = Invoke-HostUpload "litterbox" {
+        & $curl -sS --connect-timeout 20 --max-time 600 -A "sync-collab" `
+            -F "reqtype=fileupload" -F "time=72h" -F "fileToUpload=@$zipPath" `
+            "https://litterbox.catbox.moe/resources/internals/api.php"
     }
-    Write-Warn ("bashupload : " + (Get-ShortErr $raw))
+    if ($up) { return $up }
 
-    Write-Info "Tentative file.io..."
-    $raw = & $curl -sS -A "sync-collab" -F $fileForm "https://file.io/?expires=2d"
-    try {
-        $json = $raw | ConvertFrom-Json
-        if ($json.success -and $json.link) {
-            $u = [string]$json.link
-            Write-Ok "Pack envoye."
-            return [pscustomobject]@{ id = $u; url = $u; page = $u }
+    # 0x0.st : simple, lien direct
+    $up = Invoke-HostUpload "0x0.st" {
+        & $curl -sS --connect-timeout 20 --max-time 600 -A "sync-collab" `
+            -F "file=@$zipPath" "https://0x0.st"
+    }
+    if ($up) { return $up }
+
+    # catbox permanent (max ~200 Mo)
+    if ($sizeMb -le 190) {
+        $up = Invoke-HostUpload "catbox" {
+            & $curl -sS --connect-timeout 20 --max-time 600 -A "sync-collab" `
+                -F "reqtype=fileupload" -F "fileToUpload=@$zipPath" `
+                "https://catbox.moe/user/api.php"
         }
-    } catch { }
-    Write-Warn ("file.io : " + (Get-ShortErr $raw))
+        if ($up) { return $up }
+    } else {
+        Write-Warn "catbox ignore (pack trop gros)."
+    }
 
-    throw "Echec upload : tous les hebergeurs ont refuse. Reessaie dans 2 minutes."
+    $up = Invoke-HostUpload "bashupload" {
+        & $curl -sS --connect-timeout 20 --max-time 600 -A "sync-collab" `
+            -T $zipPath "https://bashupload.com/serveur-pack.zip"
+    }
+    if ($up) { return $up }
+
+    $up = Invoke-HostUpload "file.io" {
+        & $curl -sS --connect-timeout 20 --max-time 600 -A "sync-collab" `
+            -F "file=@$zipPath" "https://file.io/?expires=2d"
+    }
+    if ($up) { return $up }
+
+    # pixeldrain (API fichier)
+    $up = Invoke-HostUpload "pixeldrain" {
+        $raw = & $curl -sS --connect-timeout 20 --max-time 600 -A "sync-collab" `
+            -T $zipPath "https://pixeldrain.com/api/file/"
+        try {
+            $j = ([string]$raw) | ConvertFrom-Json
+            if ($j.id) { return ("https://pixeldrain.com/api/file/" + $j.id + "?download") }
+        } catch { }
+        return $raw
+    }
+    if ($up) { return $up }
+
+    throw ("Echec upload (" + $sizeMb + " Mo) : tous les hebergeurs ont refuse. Verifie ta connexion / antivirus, ou envoie le zip a la mano (Discord/Drive) puis reessaie dans 2 minutes.")
 }
 
 function Publish-Manifest($cfg, $up, $sizeBytes) {
